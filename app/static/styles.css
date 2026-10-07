@@ -13,3 +13,50 @@ main{flex:1;min-width:0}.topbar{height:51px;border-bottom:1px solid var(--line);
 .capture-diagnostic{margin-top:12px;padding-top:9px;border-top:1px solid var(--line)}.capture-diagnostic>summary{font-size:11px;cursor:pointer;color:var(--muted)}.capture-diagnostic>p{margin-top:6px;font-size:11px}.capture-diagnostic>a{display:inline-block;font-size:11px;margin-top:8px}.capture-diagnostic-image{display:block;width:100%;max-width:640px;max-height:320px;object-fit:contain;object-position:left top;margin-top:9px;border:1px solid var(--line);background:var(--surface)}
 .capture-advanced{margin:12px 0}.capture-advanced>summary{cursor:pointer;color:var(--accent);font-size:12px}.capture-advanced>summary .muted{font-size:11px}.capture-advanced[open]{margin-bottom:16px}.ai-settings:not([open]){padding:12px 18px}.page-heading{margin-bottom:18px}.main-content{padding-top:22px}.capture-panel{padding-top:16px}.panel-heading{margin-bottom:13px}.panel-heading p{display:none}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*::before,*::after{animation:none!important;transition:none!important}}
+
+/* The guided application has one primary action and progressive disclosure. */
+.guided {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 32px 20px;
+  display: grid;
+  gap: 20px;
+}
+.guided-heading, .guided-report-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+.guided-heading h1 { margin: 8px 0; }
+.guided-heading > span { font-size: 12px; color: var(--muted); }
+.guided form { display: grid; gap: 16px; }
+.guided .form-field { font-size: 14px; }
+.guided .form-field input, .guided .form-field select {
+  padding: 11px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+}
+.guided-options { display: flex; flex-wrap: wrap; gap: 20px; align-items: start; }
+.guided-options > .form-field { flex: 1; min-width: 180px; }
+.guided .source-options { border: 0; margin: 0; padding: 0; flex-wrap: wrap; }
+.guided .source-options legend { margin-bottom: 9px; font-weight: 600; }
+.guided .source-options label { font-size: 14px; }
+.guided-details summary { cursor: pointer; font-weight: 550; }
+.guided-details[open] > summary { margin-bottom: 16px; }
+.guided-details .guided-options { margin-bottom: 12px; }
+.guided #guided-analyze { font-size: 16px; min-height: 48px; }
+.guided #guided-browser { margin-top: 16px; font-size: 12px; }
+.guided-progress { margin-top: 20px; display: grid; gap: 10px; }
+.guided progress { width: 100%; accent-color: var(--accent); }
+.guided .notice { margin-top: 14px; }
+.guided-record { border-top: 1px solid var(--line); padding: 12px 0; }
+.guided-record summary { overflow-wrap: anywhere; }
+.guided-record img { max-width: 100%; max-height: 360px; object-fit: contain; margin: 12px 8px 0 0; }
+.guided footer { font-size: 12px; }
+@media (max-width: 620px) {
+  .guided { padding: 20px 12px; }
+  .guided .source-options { display: grid; gap: 10px; }
+}

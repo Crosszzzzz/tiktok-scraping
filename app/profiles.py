@@ -17,6 +17,7 @@ from app import store
 
 SOURCES = {"uploads", "reposts", "likes", "manual"}
 SETTINGS = {"label", "notes", "tags", "sources", "max_items", "scroll_rounds", "mode", "headless",
+            "depth", "date_filter", "session_mode", "wait_captcha",
             "avatar_path", "avatar_source", "avatar_updated_at"}
 METRICS_HISTORY_LIMIT = 100
 _INTERNAL = {"records", "run_ids", "collection", "collection_updated_at", "capture_blockers"}
@@ -85,7 +86,7 @@ def _empty(profile, created_at=None):
     timestamp = created_at if _instant(created_at) else store.now()
     return dict(profile=profile, label=f"@{profile}", notes="", tags=[],
                 sources=["uploads", "reposts", "likes"], max_items=20, scroll_rounds=8,
-                mode="incremental", headless=True, avatar_path=None, avatar_source="initials", avatar_updated_at=None,
+                mode="incremental", headless=False, depth='quick', date_filter='any', session_mode='logged_in', avatar_path=None, avatar_source="initials", avatar_updated_at=None,
                 created_at=timestamp, updated_at=timestamp,
                 last_run_at=None, last_run_id=None, last_run_status=None, last_capture_reason=None,
                 record_count=0, capture_blockers=[],
@@ -407,6 +408,9 @@ def save_profile(profile: str, updates: dict) -> dict:
             raise ValueError(f"Límite de perfil inválido: {field}.")
     if "mode" in changes and changes["mode"] not in {"incremental", "refresh"}:
         raise ValueError("Modo de captura inválido.")
+    for field, choices in (('depth',{'quick','custom','deep','all'}), ('date_filter',{'any','last30days'}), ('session_mode',{'anonymous','logged_in'})):
+        if field in changes and changes[field] not in choices:
+            raise ValueError('Preferencia de captura inválida: '+field)
     if "headless" in changes and type(changes["headless"]) is not bool:
         raise ValueError("La captura en segundo plano debe ser true o false.")
     if "avatar_source" in changes and (not isinstance(changes["avatar_source"], str) or changes["avatar_source"] not in {"profile_capture", "user_upload", "initials"}):
@@ -432,18 +436,20 @@ def save_profile(profile: str, updates: dict) -> dict:
         return _public(data)
 
 
-def known_records(profile: str) -> dict[str, dict]:
+def known_records(profile: str, *, migrate=True) -> dict[str, dict]:
     name = store.profile_name(profile)
     with store.LOCK:
-        _ensure_migrated()
+        if migrate:
+            _ensure_migrated()
         return copy.deepcopy(_read_profile(name)["records"])
 
 
-def sync_run(run: dict) -> dict:
+def sync_run(run: dict, *, migrate=True) -> dict:
     with store.LOCK:
-        _ensure_migrated(skip_run=run.get("id"))
+        if migrate:
+            _ensure_migrated(skip_run=run.get("id"))
         result = _sync(run)
-        if not run.get("is_demo") and not run.get("aggregate"):
+        if migrate and not run.get("is_demo") and not run.get("aggregate"):
             path = store.DATA / "profiles" / "_migration.json"
             ledger = _read(path, {})
             digest = _fingerprint(run)

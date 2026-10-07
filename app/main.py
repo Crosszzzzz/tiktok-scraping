@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from app import store
 from app.capture import POOL, NeedsAttention, session
 
@@ -68,26 +68,40 @@ async def missing(request, exc):
 
 class ProfileInput(BaseModel):
     profile: str = ''
+    session_mode: Literal['logged_in'] = 'logged_in'
     @field_validator('profile')
     @classmethod
     def validate_profile(cls, value):
         return store.profile_name(value) if value else ''
 
 class CaptureInput(ProfileInput):
+    @model_validator(mode='before')
+    @classmethod
+    def normalize_preset_limits(cls, value):
+        from app.planning import DEPTHS
+        if isinstance(value, dict):
+            depth = value.get('depth', 'quick')
+            preset = DEPTHS.get(depth) if isinstance(depth, str) else None
+            if preset:
+                return {**value, 'max_items':preset[0], 'scroll_rounds':preset[1]}
+        # Custom values retain strict field validation, without silent clamping.
+        return value
+
     sources: list[Literal['uploads','reposts','likes']] = Field(default_factory=lambda:['uploads','reposts','likes'], min_length=1,max_length=3)
     max_items: int = Field(default=20, ge=1, le=200)
     scroll_rounds: int = Field(default=8, ge=1, le=50)
     mode: Literal['incremental','refresh'] = 'incremental'
-    headless: bool = True
-    wait_captcha: bool = True
+    headless: bool = False
+    wait_captcha: Literal[False] = False
+    visual_limit: int = Field(default=10, ge=1, le=50)
+    visual_enabled: bool = True
+    depth: Literal['quick','custom','deep','all'] = 'quick'
+    date_filter: Literal['any','last30days'] = 'any'
 
-class AutoInput(ProfileInput):
-    sources: list[Literal['uploads','reposts','likes']] = Field(default_factory=lambda:['uploads','reposts','likes'], min_length=1,max_length=3)
-    max_items: int = Field(default=30, ge=1, le=200)
-    scroll_rounds: int = Field(default=12, ge=1, le=50)
-    publish: bool = True
+class AutoInput(CaptureInput):
+    publish: Literal[False] = False
 
-class SavedProfileInput(ProfileInput):
+class SavedProfileInput(CaptureInput):
     label: str = Field(default='',max_length=100)
     notes: str = Field(default='',max_length=5000)
     tags: list[str] = Field(default_factory=list,max_length=20)
@@ -95,7 +109,7 @@ class SavedProfileInput(ProfileInput):
     max_items: int = Field(default=20,ge=1,le=200)
     scroll_rounds: int = Field(default=8,ge=1,le=50)
     mode: Literal['incremental','refresh'] = 'incremental'
-    headless: bool = True
+    headless: bool = False
 
 class ImportInput(ProfileInput):
     records: list[dict] = Field(max_length=2000)
@@ -115,25 +129,28 @@ class EditInput(BaseModel):
     repost_note_source: Literal['visible','user_verified'] | None = None
 
 class AISettingsInput(BaseModel):
-    provider: Literal['local','gemini'] | None = None
+    provider: Literal['disabled','gemini'] | None = None
     model: str | None = Field(default=None,max_length=100)
     api_key: str | None = Field(default=None,max_length=512,repr=False)
     auto_visual: bool | None = None
     max_per_run: int | None = Field(default=None,ge=1,le=50)
 
 def analyze(run):
-    from app.analysis import analyze_records
+    from app.analysis import analyze_records, executive_report, eligible_records
     from app.profiles import sync_run
-    run['analysis'] = analyze_records(run['records'])
+    options=run.get('collection',{}).get('options',{})
+    run['analysis'] = analyze_records(list(eligible_records(run['records'],options)))
+    run['analysis']['executive'] = executive_report(run)
     store.save_run(run)
-    sync_run(run)
+    sync_run(run, migrate=not options.get('isolate_history',False))
     return run
 
 def cumulative_report(profile):
     from app.profiles import profile_report
-    from app.analysis import analyze_records
+    from app.analysis import analyze_records, executive_report, eligible_records
     run=profile_report(store.profile_name(profile))
-    run['analysis']=analyze_records(run['records'])
+    run['analysis']=analyze_records(list(eligible_records(run['records'],run.get('collection',{}).get('options',{}))))
+    run['analysis']['executive']=executive_report(run)
     return run
 
 def job_new(message: str, run_id: str | None = None):
@@ -189,6 +206,8 @@ async def saved_profiles():
 
 @app.post('/api/profiles')
 async def save_profile(body:SavedProfileInput):
+    from app.planning import capture_options
+    capture_options(body)
     from app.profiles import save_profile
     if not body.profile:
         raise HTTPException(422,'Introduce un perfil.')
@@ -217,7 +236,7 @@ async def export_profile(profile:str,format:Literal['json','md']='json'):
     run=await get_profile_report(profile)
     return export_response(run,format)
 
-@app.post('/api/profiles/{profile}/publish')
+# Public deployment is deliberately not registered as an application route.
 async def publish_profile(profile:str,deploy:bool=False):
     """Build a sanitized static report and, optionally, publish it to Vercel."""
     await saved_profile(profile)
@@ -258,67 +277,98 @@ async def upload_avatar(profile:str,file:UploadFile=File(...)):
 async def open_session(body: ProfileInput):
     if busy():
         raise HTTPException(409,'Espera a que termine el trabajo actual o cancélalo.')
+    job=job_new('Abriendo navegador…')
+    job['status']='running'
     try:
-        return await asyncio.wrap_future(POOL.submit(session.open,body.profile))
+        return await asyncio.wrap_future(POOL.submit(session.show_access,body.profile))
     except NeedsAttention as exc:
-        raise HTTPException(409,str(exc))
+        job['status']='needs_attention'
+        job['message']=str(exc)
+        raise HTTPException(409, {'code':exc.code, 'message':str(exc)}) from None
+    finally:
+        if job['status']=='running':
+            job['status']='completed'
 
 @app.post('/api/session/close')
 async def close_session():
     if busy():
         raise HTTPException(409,'Cancela primero la captura en curso.')
-    return await asyncio.wrap_future(POOL.submit(session.close))
+    job=job_new('Cerrando navegador…')
+    job['status']='running'
+    try:
+        return await asyncio.wrap_future(POOL.submit(session.close))
+    finally:
+        job['status']='completed'
 
 @app.post('/api/session/login')
 async def open_login_session(body:ProfileInput):
-    """Open a normal Chrome window (no automation) so the user can log in manually."""
-    if busy():
-        raise HTTPException(409,'Espera a que termine el trabajo actual o cancélalo.')
-    from app.capture import open_login_browser
-    try:
-        await asyncio.wrap_future(POOL.submit(session.close))
-    except Exception:
-        pass
-    try:
-        await asyncio.to_thread(open_login_browser,body.profile)
-    except NeedsAttention as exc:
-        raise HTTPException(409,str(exc))
-    return {'status':'login_window_opened',
-            'message':'Se abrió una ventana NORMAL de Chrome con el perfil de la app. Iniciá sesión en TikTok, CERRÁ esa ventana y después generá el informe.'}
+    """Bring the same dedicated persistent browser forward; human controls access."""
+    result = await open_session(body)
+    return {**result, 'message':'Resuelve el acceso o la verificación manualmente en HuellaBrowser. No cierres Chrome; después vuelve a pulsar Analizar.'}
 
 async def collect(job,run,body):
     job['status']='running'
     run['status']='running'
+    collection=run.setdefault('collection',{})
+    collection['requested_sources']=list(dict.fromkeys(body.sources))
+    source_states=collection.setdefault('sources',{})
+    for source in collection['requested_sources']:
+        source_states.setdefault(source, {'status':'pending','count':0,'observed_minimum':None,
+            'visibility_status':'unknown','reason':'Fuente solicitada; todavía no evaluada.'})
     store.save_run(run)
     try:
-        await asyncio.wrap_future(POOL.submit(session.capture,job,run,list(dict.fromkeys(body.sources)),body.max_items,body.scroll_rounds,body.mode,body.headless,body.wait_captcha))
+        from app.planning import capture_options
+        options=capture_options(body)
+        run['collection']['options']=options
+        run['collection']['visual_limit']=body.visual_limit
+        run['collection']['visual_enabled']=body.visual_enabled
+        run['collection']['stage']='reading_structured_sources'
+        job['message']='Obteniendo datos y portadas de TikTok…'
+        await asyncio.wrap_future(POOL.submit(session.capture,job,run,options['sources'],options['max_items'],options['scroll_rounds'],body.mode,body.headless,body.wait_captcha,body.session_mode))
         message=f"{len(run['records'])} evidencias observadas. {('Captura cancelada.' if run['status']=='cancelled' else 'Archivo acumulado actualizado.') }"
-        if run['status']=='needs_attention':
+        if run['status']!='completed' and run['status']!='cancelled':
             message=run.get('collection',{}).get('last_capture_reason') or 'La captura necesita atención. Revisa los bloqueos; el archivo anterior se conserva.'
     except NeedsAttention as exc:
         run['status']='needs_attention'
         message=str(exc)
         run['collection']['last_capture_reason']=message
-        run['collection']['blockers']=[{'code':exc.code,'message':message,'observed_at':store.now()}]
+        run['collection'].setdefault('blockers',[]).append({'code':exc.code,'message':message,'observed_at':store.now()})
         await save_capture_diagnostic(run)
     except Exception as exc:
         run['status']='failed'
         message=f'Captura incompleta ({type(exc).__name__}). Revisa Chrome; la evidencia obtenida se conserva.'
         run['collection']['last_capture_reason']=message
-        run['collection']['blockers']=[{'code':'capture_error','message':message,'observed_at':store.now()}]
+        run['collection'].setdefault('blockers',[]).append({'code':'capture_error','message':message,'observed_at':store.now()})
         await save_capture_diagnostic(run)
     finally:
+        preview=run.get('collection',{}).get('preview',{}).get('sources',{})
+        for source in run['collection']['requested_sources']:
+            detail=source_states[source]
+            observation=preview.get(source,{})
+            if observation:
+                detail['visibility_status']=observation.get('status','unknown')
+                if detail.get('observed_minimum') is None:
+                    detail['observed_minimum']=observation.get('observed_minimum')
+            if detail.get('status')=='pending':
+                detail.update(status='interrupted' if observation else 'unassessed',
+                    reason=run['collection'].get('last_capture_reason') or 'Esta fuente no llegó a evaluarse; la disponibilidad y el total histórico son desconocidos.')
+        if run['status']=='completed' and not run.get('records'):
+            from app.capture import finalize_capture_outcome
+            finalize_capture_outcome(run)
+            message=run['collection']['last_capture_reason']
         blockers=run.get('collection',{}).get('blockers',[])
         private_profile=any(isinstance(blocker,dict) and blocker.get('code')=='private_profile' for blocker in blockers)
-        if not job.get('cancel_requested') and not private_profile:
+        if not job.get('cancel_requested') and not private_profile and run['status']=='completed':
             await auto_vision(job,run)
         if private_profile:
             message='El perfil es privado. Solo se recopila contenido público accesible; se detiene el proceso sin análisis visual ni publicación.'
             job['message']=message
             try:
                 from app.profiles import sync_run
+                from app.analysis import executive_report
+                run.setdefault('analysis',{})['executive']=executive_report(run)
                 await asyncio.to_thread(store.save_run,run)
-                await asyncio.to_thread(sync_run,run)
+                await asyncio.to_thread(sync_run,run,migrate=not run.get('collection',{}).get('options',{}).get('isolate_history',False))
             except Exception as exc:
                 job.update(status='failed',message=f'No se pudo guardar el estado de la captura ({type(exc).__name__}).')
                 return
@@ -339,16 +389,24 @@ async def save_capture_diagnostic(run):
         run['collection']['failure_diagnostic']={'status':'unavailable','reason':'No se pudo obtener una captura del estado final del navegador.'}
 
 def vision_files(row):
+    from app.analysis import safe_frame
+    if row.get('date_filter_status','included')!='included':
+        return []
     quality=row.get('frame_quality') or {}
     files=[]
     for path in row.get('frames',[]):
         info=quality.get(path,{})
-        if info.get('status') != 'verified':
+        if not safe_frame(info):
             continue
         target=store.media_path(path)
         if target.is_file():
             files.append(target)
-    return files[:8]
+    # Prefer rendered media to its grid cover, then retain early and late samples.
+    temporal=[target for target in files if quality.get(store.relative(target),{}).get('kind') in {'video_frame','photo_slide'}]
+    candidates=temporal or files
+    if len(candidates)>4:
+        candidates=[candidates[round(index*(len(candidates)-1)/3)] for index in range(4)]
+    return candidates
 
 def apply_visual_result(row,result):
     for name in ['visual_summary','visual_analysis']:
@@ -361,18 +419,25 @@ def apply_visual_result(row,result):
     row['notes']=list(dict.fromkeys(row.get('notes',[])+result.get('notes',[])))
 
 async def auto_vision(job,run):
+    if not run.get('collection',{}).get('visual_enabled',True):
+        return
     from app.vision import get_settings,analyze_record
+    from app.analysis import current_record
     settings=await asyncio.to_thread(get_settings)
     if not settings.get('auto_visual') or not settings.get('configured'):
         return
-    stats={'attempted':0,'completed':0,'failed':0,'cached':0,'limit':settings['max_per_run'],'remaining':0}
+    limit=min(settings['max_per_run'], run.get('collection',{}).get('visual_limit',settings['max_per_run']))
+    stats={'attempted':0,'completed':0,'failed':0,'cached':0,'limit':limit,'remaining':0}
     run['collection']['visual_processing']=stats
     for row in run['records']:
+        payload=current_record(row,run.get('collection',{}).get('options',{}))
+        if payload['date_filter_status']!='included':
+            continue
         if job.get('cancel_requested'):
             break
         if 'visual_summary' in (row.get('manual_fields') or {}):
             continue
-        files=vision_files(row)
+        files=vision_files(payload)
         if not files:
             continue
         if stats['attempted']>=stats['limit']:
@@ -380,7 +445,7 @@ async def auto_vision(job,run):
             continue
         job['message']=f"Interpretando imágenes: {stats['attempted']+1}/{stats['limit']}…"
         try:
-            result=await asyncio.to_thread(analyze_record,row,files)
+            result=await asyncio.to_thread(analyze_record,payload,files)
             apply_visual_result(row,result)
             if result.get('visual_analysis',{}).get('cached'):
                 stats['cached']+=1
@@ -398,23 +463,47 @@ async def auto_vision(job,run):
 
 @app.post('/api/capture')
 async def capture(body: CaptureInput):
+    from app.planning import capture_options
+    capture_options(body)
     if not body.profile:
         raise HTTPException(422,'Introduce un perfil.')
     if busy():
         raise HTTPException(409,'Ya hay un trabajo en curso.')
-    browser=session.state()
-    if not browser.get('open') and not browser.get('profile_available'):
-        raise HTTPException(409,'Abre Chrome e inicia sesión manualmente primero.')
     from app.profiles import save_profile
-    await asyncio.to_thread(save_profile,body.profile,body.model_dump(exclude={'profile','wait_captcha'}))
     run = store.new_run(body.profile)
     job = job_new('Preparando captura…',run['id'])
     job['profile']=body.profile
+    try:
+        await asyncio.to_thread(save_profile,body.profile,body.model_dump(exclude={'profile','wait_captcha','publish','visual_limit','visual_enabled'}))
+    except Exception:
+        job['status']='failed'
+        raise
     spawn(collect(job,run,body))
     return job
 
+@app.post('/api/preflight')
+async def preflight(body: CaptureInput):
+    from app.planning import capture_options
+    options=capture_options(body)
+    if not body.profile:
+        raise HTTPException(422,'Introduce un perfil.')
+    if busy():
+        raise HTTPException(409,'Hay un trabajo de navegador en curso.')
+    job=job_new('Inspeccionando rejillas visibles, sin capturas ni IA…')
+    job['status']='running'
+    try:
+        result=await asyncio.wrap_future(POOL.submit(session.preview,body.profile,options))
+        job.update(status='completed',progress=100)
+        return result
+    except NeedsAttention as exc:
+        job.update(status='needs_attention',message=str(exc))
+        raise HTTPException(409,{'code':exc.code,'message':str(exc)})
+    finally:
+        if job['status']=='running':
+            job['status']='failed'
+
 async def auto_pipeline(job,run,body):
-    """One-shot flow: open a visible session, capture, analyze and publish."""
+    """Legacy uncalled publishing pipeline; supported /api/auto is local-only."""
     browser=session.state()
     if not browser.get('open'):
         job['message']='Abriendo Chrome. Si TikTok pide verificación, resuélvela en la ventana.'
@@ -457,18 +546,8 @@ async def auto_pipeline(job,run,body):
 
 @app.post('/api/auto')
 async def auto_run(body:AutoInput):
-    if not body.profile:
-        raise HTTPException(422,'Introduce un perfil.')
-    if busy():
-        raise HTTPException(409,'Ya hay un trabajo en curso.')
-    from app.profiles import save_profile
-    await asyncio.to_thread(save_profile,body.profile,{'sources':list(dict.fromkeys(body.sources)),
-        'max_items':body.max_items,'scroll_rounds':body.scroll_rounds,'mode':'incremental','headless':False})
-    run=store.new_run(body.profile)
-    job=job_new('Preparando informe automático…',run['id'])
-    job['profile']=body.profile
-    spawn(auto_pipeline(job,run,body))
-    return job
+    # Supported one-shot workflow is local capture/report only, never deployment.
+    return await capture(body)
 
 @app.get('/api/jobs/{job_id}')
 async def get_job(job_id:str):
@@ -542,7 +621,7 @@ def import_record(raw,profile):
             raise ValueError(f'Fecha ISO inválida en {key}.') from exc
     return row
 
-@app.post('/api/import')
+# Historical import helper is not exposed in the supported application API.
 async def import_data(body:ImportInput):
     if not body.profile:
         raise HTTPException(422,'El perfil es obligatorio.')
@@ -569,6 +648,8 @@ async def edit_record(run_id:str,record_id:str,body:EditInput):
             changes['notes']=[changes['notes']]
         if changes.get('interaction_at'):
             changes['interaction_date_source']='user_verified'
+        if 'published_at' in changes:
+            changes['published_date_source']='user_verified' if changes['published_at'] else None
         if 'interaction_at' in changes and not changes['interaction_at']:
             changes['interaction_at']=None
             changes['interaction_date_source']=None
@@ -598,10 +679,12 @@ async def media_work(job,run_id,record_id,path=None,vision=False):
         row=find_record(run,record_id)
         if vision:
             from app.vision import analyze_record
-            files=vision_files(row)
+            from app.analysis import current_record
+            payload=current_record(row,run.get('collection',{}).get('options',{}))
+            files=vision_files(payload)
             if not files:
                 raise ValueError('Vuelve a capturar esta evidencia o adjunta una imagen o video. La visión requiere recortes verificados; las capturas antiguas y de página completa quedan como referencia.')
-            result=await asyncio.to_thread(analyze_record,row,files)
+            result=await asyncio.to_thread(analyze_record,payload,files)
         else:
             result=await asyncio.to_thread(process_media,path,path.parent/'processed')
             result['frames']=[store.relative(p) for p in result.get('frames',[])]
@@ -615,6 +698,7 @@ async def media_work(job,run_id,record_id,path=None,vision=False):
                     row[name]=result[name]
             row['frames']=list(dict.fromkeys(row.get('frames',[])+result.get('frames',[])))
             if not vision:
+                row['upload_ocr']={'source':'user_upload','text':result.get('ocr_text','')}
                 quality=row.setdefault('frame_quality',{})
                 for frame in result.get('frames',[]):
                     quality[frame]={'status':'verified','source':'user_upload','checked_at':store.now()}
@@ -663,7 +747,7 @@ async def vision(run_id:str,record_id:str):
     from app.vision import get_settings
     settings=await asyncio.to_thread(get_settings)
     if not settings.get('configured'):
-        raise HTTPException(409,'Configura Gemini u Ollama en Ajustes IA antes de analizar imágenes.')
+        raise HTTPException(409,'Configura Gemini en Ajustes IA antes de analizar imágenes.')
     job=job_new('Interpretando imágenes con '+settings['provider']+'…',run_id)
     spawn(media_work(job,run_id,record_id,vision=True))
     return job
@@ -683,7 +767,7 @@ def export_response(run,format):
         content_type='application/json'
     return Response(content,media_type=content_type,headers={'Content-Disposition':f'attachment; filename="huella-{run["profile"]}.{format}"'})
 
-@app.post('/api/demo')
+# Historical synthetic helper is not exposed in the supported application API.
 async def demo():
     run=store.new_run('demo_ficticia',is_demo=True)
     captions=['Receta de pasta casera #cocina','Un viaje por la montaña #viajes','Aprender a decir adiós: una escena de película #cine','Canción sobre despedidas #musica','Una comedia para el fin de semana #humor','Cena entre amigos #amistad','Decoración y canciones de Navidad #navidad','Rutina para estudiar mejor #estudio']
