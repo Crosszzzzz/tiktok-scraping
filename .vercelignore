@@ -1,0 +1,11 @@
+.browser-profile/
+.venv/
+data/
+.env
+.env.*
+!.env.example
+*.log
+__pycache__/
+.pytest_cache/
+tests/
+.git/

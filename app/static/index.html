@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101313">
+  <meta name="description" content="Observatorio local de contenido público. Reúne evidencias y explora temas a través del tiempo.">
+  <title>Huella — Observatorio de contenido</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Saltar al contenido</a>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="/" aria-label="Huella, inicio">huella</a>
+      <p class="brand-subtitle">Archivo local de TikTok</p>
+      <nav class="primary-nav" aria-label="Navegación principal">
+        <a href="#overview" class="nav-item active"><span aria-hidden="true">◫</span> Vista general</a>
+        <a href="#timeline"><span aria-hidden="true">◷</span> Cronología</a>
+        <a href="#evidence"><span aria-hidden="true">▤</span> Evidencias <span id="nav-count" class="nav-count">0</span></a>
+      </nav>
+      <div class="sidebar-section-title"><h2>Perfiles guardados</h2><button id="refresh-state" class="icon-button" type="button" aria-label="Actualizar perfiles e historial" title="Actualizar">↻</button></div>
+      <div id="profiles-list" class="profiles-list"><p class="sidebar-empty">Guarda un perfil para continuar después.</p></div>
+      <details class="history-panel" open><summary>Historial de capturas</summary>
+      <div id="runs-list" class="runs-list"><p class="sidebar-empty">Tus exploraciones aparecerán aquí.</p></div>
+      </details>
+      <div class="sidebar-bottom">
+        <button type="button" id="demo-button" class="demo-button">Cargar ejemplo ficticio</button>
+        <label class="import-button" for="import-file">Importar evidencias JSON <span aria-hidden="true">↑</span></label>
+        <input id="import-file" type="file" accept="application/json,.json" class="visually-hidden">
+      </div>
+    </aside>
+
+    <main id="main">
+      <header class="topbar"><div><span class="breadcrumb">Espacio local</span><span class="breadcrumb-separator">/</span><span>Vista general</span></div><div class="connection"><span id="connection-dot" class="status-dot"></span><span id="connection-label">Conectando…</span></div></header>
+      <div class="main-content">
+        <section class="page-heading" id="overview"><div><h1>Perfiles y actividad</h1><p class="heading-description">Archivo acumulado de publicaciones, compartidos y me gusta públicos.</p></div></section>
+
+        <section class="capture-panel" aria-labelledby="capture-heading">
+          <div class="panel-heading"><div><h2 id="capture-heading">Actualizar un perfil</h2><p>Busca novedades y reutiliza el contenido que ya guardaste.</p></div><span id="browser-badge" class="badge">Navegador cerrado</span></div>
+          <form id="capture-form">
+            <div class="capture-input-row"><label class="profile-input-wrap"><span class="visually-hidden">Perfil o URL de TikTok</span><span aria-hidden="true">@</span><input id="profile-input" name="profile" autocomplete="off" placeholder="usuario o tiktok.com/@usuario" value="adry_zg26" required maxlength="300"></label><button id="session-button" class="button button-secondary" type="button"><span aria-hidden="true">↗</span> Abrir sesión</button><button id="login-button" class="button button-secondary" type="button">Iniciar sesión (Chrome normal)</button><button id="capture-button" class="button button-primary" type="submit">Actualizar: solo nuevos</button><button id="auto-button" class="button button-primary" type="button">⚡ Generar y publicar informe</button></div>
+            <details class="capture-advanced"><summary>Opciones de captura <span id="capture-options-summary" class="muted">· sin ventana</span></summary><div class="capture-options"><fieldset class="source-options"><legend class="visually-hidden">Contenido para capturar</legend><label><input type="checkbox" name="source" value="uploads" checked><span>Publicaciones</span></label><label><input type="checkbox" name="source" value="reposts" checked><span>Compartidos</span></label><label><input type="checkbox" name="source" value="likes" checked><span>Me gusta públicos</span></label></fieldset><div class="limit-option"><label for="max-items" id="max-items-label">Nuevos por sección</label><select id="max-items"><option value="3">3 elementos · prueba</option><option value="15">15 elementos</option><option value="30" selected>30 elementos</option><option value="60">60 elementos</option><option value="100">100 elementos</option></select></div></div>
+            <div class="capture-mode-row"><label for="capture-mode">Tipo de actualización</label><select id="capture-mode"><option value="incremental">Solo nuevos · reutilizar lo analizado</option><option value="refresh">Revisar también los ya conocidos</option></select></div>
+            <p id="capture-mode-hint" class="capture-mode-hint">Los elementos conocidos conservan su contexto. Se buscan novedades dentro del límite de recorrido; una captura parcial no elimina el historial.</p>
+            <label class="headless-option"><input id="capture-headless" type="checkbox" checked> Capturar sin ventana<span>La primera sesión se abre manualmente. Después se reutiliza para capturar en segundo plano. Sin ventana, una verificación de TikTok detiene la captura; con ventana, la aplicación espera a que la resuelvas y continúa sola.</span></label>
+            <label class="headless-option"><input id="auto-publish" type="checkbox" checked> Al generar, publicar el informe en un enlace público (Vercel)<span>Solo se sube el informe sanitizado: sin cookies, sin rutas locales ni la API key.</span></label>
+            <details class="profile-settings"><summary>Guardar perfil y preferencias <span id="saved-profile-status"></span></summary><div class="profile-fields"><div class="profile-photo-field full"><img id="profile-avatar-preview" class="profile-avatar-preview" alt="Foto del perfil guardado" hidden><label class="form-field">Foto del perfil<input id="profile-avatar-file" type="file" accept="image/png,image/jpeg,image/webp"><span>Se intenta obtener la foto pública durante la captura. También puedes elegir una imagen local.</span></label></div><label class="form-field">Nombre para identificarlo<input id="profile-label" maxlength="100" placeholder="Opcional"></label><label class="form-field">Etiquetas de organización<input id="profile-tags" maxlength="500" placeholder="Separadas por comas"></label><label class="form-field full">Notas del proyecto<textarea id="profile-notes" rows="2" maxlength="5000" placeholder="Objetivo, fuentes o pendientes de esta exploración"></textarea></label><label class="form-field">Límite de desplazamientos por sección<input id="scroll-rounds" type="number" min="1" max="50" value="12"><span>Un recorrido mayor puede encontrar más elementos antiguos. No garantiza cubrir todo el perfil.</span></label><div class="profile-save-action"><button type="button" class="button button-small" id="save-profile">Guardar perfil</button></div></div></details>
+            </details>
+          </form>
+          <div class="session-help"><span aria-hidden="true">ⓘ</span><p id="session-hint">Abre la sesión e inicia sesión manualmente la primera vez. Después, inicia la captura. Solo se recopila lo que tu navegador puede ver.</p><button type="button" id="close-session" class="text-button" hidden>Cerrar navegador</button></div>
+          <div id="active-job" class="job-panel" hidden aria-live="polite"><div class="job-info"><span class="spinner" aria-hidden="true"></span><div><strong id="job-title">Procesando</strong><p id="job-message">Preparando la exploración…</p></div><button class="button button-small" type="button" id="cancel-job">Cancelar</button></div><progress id="job-progress" max="100" aria-label="Progreso"></progress></div>
+          <div id="publish-result" class="notice" hidden></div>
+        </section>
+
+        <div id="notice" class="notice" role="status" hidden></div>
+        <details class="card ai-settings"><summary>Ajustes de interpretación con IA <span id="ai-settings-summary" class="muted"></span></summary><form id="ai-settings-form" class="ai-settings-form"><label class="form-field">Proveedor<select id="ai-provider"><option value="local">Local · Ollama</option><option value="gemini">Google Gemini</option></select></label><label class="form-field">Modelo Gemini<input id="ai-model" value="gemini-3.8-flash" maxlength="100" autocomplete="off"></label><label class="form-field full" id="ai-key-field">API key de Gemini<input id="ai-key" type="password" maxlength="512" autocomplete="new-password" placeholder="Dejar vacío para conservar la clave actual"><span>La clave no se muestra al volver a abrir los ajustes.</span></label><p class="ai-disclosure full" id="ai-disclosure">Al activar Gemini, las imágenes recortadas y el texto del contenido, incluidas referencias musicales, se envían a Google para su interpretación. Las cookies de tu sesión no se envían. Una referencia musical no sustituye escuchar el audio.</p><label class="headless-option"><input id="ai-auto-visual" type="checkbox"> Interpretar imágenes al capturar</label><label class="form-field">Máximo de interpretaciones por captura<input id="ai-max-per-run" type="number" value="10" min="1" max="50"></label><p id="ai-settings-status" class="ai-status full" role="status">Consultando configuración…</p><div class="ai-actions full"><button id="save-ai-settings" type="submit" class="button button-small">Guardar ajustes</button><button id="delete-ai-key" type="button" class="button button-small">Borrar clave guardada</button></div></form></details>
+
+        <section id="report-empty" class="empty-state">
+          <h2>Aún no hay un perfil abierto</h2><p>Selecciona un perfil guardado o realiza una primera captura. Aquí aparecerán el resumen, la cronología y las evidencias.</p>
+        </section>
+
+        <div id="report" hidden>
+          <section class="report-heading"><div><p class="eyebrow" id="report-kicker">EXPLORACIÓN</p><h2 id="report-profile">@perfil</h2><p id="report-meta"></p></div><div class="report-actions"><button id="view-profile" type="button" class="button button-small" hidden>Ver archivo acumulado</button><button id="analyze-button" type="button" class="button button-small">↻ Reanalizar</button><a id="export-json" class="button button-small" href="#" download>JSON ↓</a><a id="export-md" class="button button-small" href="#" download>Informe ↓</a></div></section>
+          <div id="demo-notice" class="demo-notice" hidden>DATOS FICTICIOS · Este ejemplo ilustra la aplicación y no describe a ninguna persona real.</div>
+          <div class="insights-grid"><section class="card synthesis-card" aria-labelledby="synthesis-heading"><div class="section-heading"><p class="eyebrow">LECTURA DE LA MUESTRA</p><span class="small-symbol" aria-hidden="true">✳</span></div><h2 id="synthesis-heading">Lo que aparece en el contenido</h2><p id="analysis-summary" class="summary-text"></p><ul id="thematic-profile" class="thematic-profile"></ul><div class="scope-note"><span aria-hidden="true">ⓘ</span><p>Compartir o dar me gusta no confirma una vivencia. Los temas describen esta muestra; no permiten deducir personalidad, diagnósticos ni acontecimientos privados.</p></div></section><section class="card topics-card" aria-labelledby="topics-heading"><div class="section-heading"><div><p class="eyebrow">RECURRENCIAS</p><h2 id="topics-heading">Mapa de temas</h2></div><span class="small-symbol" aria-hidden="true">◈</span></div><div id="topics-list" class="topics-list"></div><p class="section-footnote">Un video puede aparecer en más de un tema.</p></section></div>
+          <div id="collection-status" class="collection-status"></div>
+          <div id="incremental-summary" class="incremental-summary" hidden></div>
+          <section class="metrics-grid" aria-label="Resumen de evidencias"><article class="metric-card"><span class="metric-label">Evidencias únicas</span><strong id="metric-total">0</strong><span id="metric-total-detail" class="metric-detail">En esta muestra</span></article><article class="metric-card"><span class="metric-label">Temas detectados</span><strong id="metric-topics">0</strong><span class="metric-detail">En el contenido disponible</span></article><article class="metric-card"><span class="metric-label">Interacciones con fecha</span><strong id="metric-dated">0</strong><span id="metric-dated-detail" class="metric-detail">Para la cronología de interacción</span></article><article class="metric-card"><span class="metric-label">Contexto disponible</span><strong id="metric-context">0<span>%</span></strong><span class="metric-detail">Con texto, audio o descripción</span></article></section>
+
+
+          <section class="card sources-card" aria-labelledby="sources-heading"><div class="section-heading"><div><p class="eyebrow">CADA FUENTE, EN SU CONTEXTO</p><h2 id="sources-heading">Publicaciones y actividad</h2></div><span class="small-symbol" aria-hidden="true">◫</span></div><div id="source-comparison" class="source-comparison"></div></section>
+
+          <section class="card timeline-card" id="timeline" aria-labelledby="timeline-heading"><div class="section-heading"><div><p class="eyebrow">PATRONES EN EL TIEMPO</p><h2 id="timeline-heading">Cronología del contenido</h2></div><div class="segmented-control" role="group" aria-label="Tipo de cronología"><button type="button" data-timeline="interaction" class="selected" aria-pressed="true">Interacciones</button><button type="button" data-timeline="uploads" aria-pressed="false">Publicaciones propias</button><button type="button" data-timeline="original" aria-pressed="false">Publicación original</button></div></div><p id="timeline-explanation" class="muted">Solo fechas verificadas de compartido o me gusta. La fecha de publicación del video no indica cuándo se compartió.</p><div id="timeline-chart" class="timeline-chart"></div><div id="timeline-key" class="timeline-key"></div><div id="timeline-changes" class="timeline-changes"></div></section>
+
+          <section class="card periods-card" aria-labelledby="periods-heading"><div class="section-heading"><div><p class="eyebrow">TEMAS Y FECHAS DOCUMENTADAS</p><h2 id="periods-heading">Períodos temáticos</h2></div><span class="small-symbol" aria-hidden="true">◷</span></div><p class="muted">La recurrencia permite describir el contenido de una etapa. Un tema de despecho no confirma una ruptura ni una infidelidad.</p><div id="thematic-periods" class="thematic-periods"></div></section>
+          <section class="card mentions-card" aria-labelledby="mentions-heading"><div class="section-heading"><div><p class="eyebrow">QUIÉN ESCRIBIÓ QUÉ</p><h2 id="mentions-heading">Menciones con contexto</h2></div><span class="small-symbol" aria-hidden="true">@</span></div><p class="muted">Distingue una nota del compartido de la descripción del creador original. Una etiqueta documenta una mención; por sí sola no confirma una relación de pareja.</p><div id="mentions-list" class="mentions-list"></div></section>
+          <details class="card quality-card"><summary>Cobertura y contenido no disponible</summary><div id="data-quality" class="data-quality"></div></details>
+          <div class="detail-grid"><section class="card" aria-labelledby="context-heading"><div class="section-heading"><div><p class="eyebrow">CALIDAD DE LA MUESTRA</p><h2 id="context-heading">Capas de contexto</h2></div><span class="small-symbol" aria-hidden="true">▧</span></div><div id="coverage-list" class="coverage-list"></div><p class="section-footnote">Las imágenes y canciones aportan contexto. El significado se conserva como evidencia, con su fuente.</p></section><section class="card" aria-labelledby="music-heading"><div class="section-heading"><div><p class="eyebrow">REFERENCIAS DE AUDIO</p><h2 id="music-heading">Música en la muestra</h2></div><span class="small-symbol" aria-hidden="true">♫</span></div><div id="music-list" class="music-list"></div></section></div>
+
+          <section class="evidence-section" id="evidence" aria-labelledby="evidence-heading"><div class="section-heading"><div><p class="eyebrow">SIEMPRE VUELVE A LA FUENTE</p><h2 id="evidence-heading">Archivo de evidencias <span id="evidence-count" class="count-label">0</span></h2></div><div class="evidence-controls"><label class="search-wrap"><span aria-hidden="true">⌕</span><input type="search" id="evidence-search" placeholder="Buscar en el contenido…" aria-label="Buscar evidencias"></label><select id="evidence-source" aria-label="Filtrar por tipo"><option value="all">Todo el contenido</option><option value="uploads">Publicaciones</option><option value="reposts">Compartidos</option><option value="likes">Me gusta</option><option value="manual">Importados</option></select></div></div><div id="active-filter" class="active-filter" hidden><span></span><button id="clear-filter" class="text-button" type="button">Quitar filtro ×</button></div><div id="evidence-grid" class="evidence-grid"></div><div id="evidence-pagination" class="pagination"></div></section>
+
+          <details class="limitations-panel"><summary>Alcance y limitaciones de esta exploración</summary><ul id="limitations-list"></ul></details>
+        </div>
+        <footer class="footer"><span class="footer-tagline">Datos y sesión guardados en este equipo.</span><div id="capabilities" class="capabilities" aria-label="Herramientas disponibles"></div></footer>
+      </div>
+    </main>
+  </div>
+  <dialog id="evidence-dialog" class="evidence-dialog"><form method="dialog" class="dialog-topbar"><span class="eyebrow">DETALLE DE EVIDENCIA</span><button class="icon-button" aria-label="Cerrar detalle" autofocus>×</button></form><div id="dialog-content"></div></dialog>
+  <div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

@@ -1,0 +1,9 @@
+fastapi>=0.115,<1
+uvicorn>=0.34,<1
+playwright>=1.51,<2
+python-multipart>=0.0.20,<1
+opencv-python>=4.11,<5
+rapidocr-onnxruntime>=1.4,<2
+Pillow>=11,<13
+pytest>=8,<10
+httpx>=0.28,<1
