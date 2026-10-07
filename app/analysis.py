@@ -456,6 +456,84 @@ def analyze_records(records: list[dict]) -> dict:
     return result
 
 
+def executive_report(run):
+    """Coverage and actionable evidence, not a personal profile."""
+    records=run.get('records',[])
+    analysis=run.get('analysis',{})
+    collection=run.get('collection',{})
+    sources=collection.get('sources',{})
+    requested=collection.get('requested_sources') or collection.get('options',{}).get('sources',[])
+    coverage=[]
+    for source in ('uploads','reposts','likes','manual'):
+        rows=[row for row in records if row.get('source')==source]
+        detail=sources.get(source,{})
+        if not rows and not detail and source not in requested:
+            continue
+        eligible=list(eligible_records(rows,run.get('collection',{}).get('options',{})))
+        coverage.append({'source':source,'observed':len(rows),'observed_minimum':detail.get('observed_minimum',len(rows)),
+            'analyzed':sum(bool(row.get('caption') or row.get('ocr_text') or row.get('visual_summary') or row.get('transcript')) for row in eligible),
+            'visual_analyzed':sum(bool(row.get('visual_summary')) for row in eligible),
+            'unknown_publication_dates':sum(not row.get('published_at') for row in rows),
+            'excluded_by_date':sum(row.get('date_filter_status')=='outside_window' for row in rows),
+            'unknown_date_filter':sum(row.get('date_filter_status')=='unknown_date' for row in rows),
+            'status':detail.get('status','observed' if rows else 'unassessed'),
+            'visibility_status':detail.get('visibility_status','unknown'),
+            'reason':detail.get('reason') or ('Disponibilidad no evaluada; cero registros recopilados no demuestra ausencia de contenido.' if not rows else 'Muestra observada, sin total histórico conocido.'),
+            'stop_reason':detail.get('stop_reason'), 'total':None})
+    by_id={row.get('id'):row for row in records}
+    themes=[{'name':topic['name'],'count':topic['count'],
+             'evidence':[{'id':identifier,'url':by_id.get(identifier,{}).get('url')} for identifier in topic.get('evidence_ids',[])[:8]]}
+            for topic in analysis.get('topics',[])[:5]]
+    return {'summary':analysis.get('summary',''),'coverage':coverage,'themes':themes,
+            'date_provenance':'Fechas originales visibles o verificadas; fechas desconocidas conservadas. Compartidos y Me gusta no tienen fecha de acción inferida.',
+            'limitations':analysis.get('limitations',[]) + ['Recuento observado mínimo, no total histórico. Fotogramas acotados; no se escuchó audio del navegador.'],
+            'next_steps':['Revisar los enlaces y textos de los temas principales.',
+                          'Resolver manualmente las fuentes bloqueadas y repetir captura incremental.',
+                          'Verificar fechas desconocidas; adjuntar audio local solo si hace falta transcripción opcional.']}
+
+
+def safe_record(row):
+    """Rebuild derived context only from individually attributable safe evidence."""
+    result=dict(row)
+    quality=row.get('frame_quality') or {}
+    safe_paths={path for path in row.get('frames',[]) if safe_frame(quality.get(path,{}))}
+    manual=row.get('manual_fields') or {}
+    if 'ocr_text' not in manual:
+        texts=[item.get('text','') for item in row.get('ocr_sequence',[])
+               if item.get('frame') in safe_paths]
+        upload=row.get('upload_ocr') or {}
+        if upload.get('source')=='user_upload':
+            texts.append(upload.get('text',''))
+        result['ocr_text']='\n\n'.join(dict.fromkeys(text for text in texts if text))
+    if 'visual_summary' not in manual:
+        provenance=(row.get('visual_analysis') or {}).get('safe_input_paths',[])
+        if not provenance or not set(provenance).issubset(safe_paths):
+            result['visual_summary']=''
+            result['visual_analysis']={}
+    return result
+
+
+def safe_frame(info):
+    return info.get('status')=='verified' and (info.get('source')=='user_upload' or
+        (info.get('source')=='profile_capture' and info.get('overlay_guard_version')==1) or
+        (info.get('source')=='tiktok_cdn' and info.get('validation_version')==1))
+
+
+def current_record(row, options):
+    from app.planning import date_eligibility
+    row['date_filter_status']=date_eligibility(row,options)
+    return safe_record(row)
+
+
+def eligible_records(records, options=None):
+    """Share sanitized evidence between thematic analysis and coverage counts."""
+    for row in records:
+        row=current_record(row,options) if options is not None else safe_record(row)
+        if row.get('date_filter_status','included')!='included':
+            continue
+        yield row
+
+
 def _md(value):
     value = html.escape(str(value or ""), quote=False).replace("\n", " ")
     return re.sub(r"([\\`*_{\[\]}|])", r"\\\1", value)
@@ -481,6 +559,13 @@ def build_markdown_report(run: dict) -> str:
         return ", ".join(parts) or "Sin evidencia enlazada"
 
     lines = ["# Análisis del contenido observado", ""]
+    executive=result.get('executive') or executive_report({**run,'analysis':result})
+    lines.extend(['## Resumen ejecutivo','',_md(executive['summary']),'','### Cobertura por fuente',''])
+    for item in executive['coverage']:
+        lines.append(f"- {_md(SOURCE_LABELS.get(item['source'],item['source']))}: {item['observed']} observados, {item['analyzed']} con texto analizable, {item['visual_analyzed']} interpretados visualmente; estado {_md(item['status'])}; total histórico desconocido.")
+    lines.extend(['',_md(executive['date_provenance']),'','### Próximos pasos',''])
+    lines.extend('- '+_md(step) for step in executive['next_steps'])
+    lines.append('')
     collection = run.get("collection") if isinstance(run.get("collection"), dict) else {}
     if run.get("is_demo") or collection.get("method") == "synthetic_demo":
         lines.extend(["**EJEMPLO FICTICIO. Datos inventados para demostrar la aplicación; no corresponden a un perfil real.**", ""])

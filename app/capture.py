@@ -1,14 +1,15 @@
 """Visible-page collector with a dedicated persistent Chrome profile.
 
-No hidden endpoints, copied cookies, stealth patches, or CAPTCHA solving.
+Reads native feed responses first, with visible DOM fallback.
+No copied cookies, stealth patches, or CAPTCHA solving.
 All Playwright work executes on one worker thread (Windows compatible).
 """
 from __future__ import annotations
 import os
 import re
-import shutil
-import subprocess
+import hashlib
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
@@ -22,9 +23,10 @@ TABS = {'uploads':'videos-tab', 'reposts':'repost-tab', 'likes':'liked-tab'}
 LABELS = {'uploads':r'^(V[ií]deos|Publicaciones|Posts)$', 'reposts':r'^(Publicaciones compartidas|Reposts?|Republicaciones|Compartidos|Compartidas)$', 'likes':r'^(Me gustó|Me gusta|Liked|Liked videos)$'}
 CAPTCHA_SELECTOR = 'iframe[src*="captcha" i], iframe[src*="verify" i], iframe[title*="captcha" i], [data-e2e="captcha"], #captcha_container, .captcha_verify_container'
 VERIFY_PATTERN = r'drag\s+the\s+slider|fit\s+the\s+puzzle|rotate\s+(?:the\s+)?(?:picture|image)|drag\s+the\s+puzzle|verify\s+to\s+continue|arrastra\s+(?:el\s+)?(?:rompecabezas|deslizador)|verifica\s+para\s+continuar|demuestra\s+que\s+eres\s+humano|gira\s+(?:la\s+)?imagen'
+INTRO_PATTERN = r'avanza\s+con\s+el\s+mouse\s+para\s+continuar|move\s+(?:your\s+)?mouse\s+to\s+continue|desliza\s+para\s+continuar|swipe\s+to\s+continue'
 VERIFY_TEXT_CHECK = '''(body,pattern) => {
   const matches=new RegExp(pattern,'i');
-  const excluded='article,[data-e2e="browse-video-desc"],[data-e2e="video-desc"],[data-e2e*="comment"],[data-e2e="user-bio"],[data-e2e="browse-user-bio"]';
+   const excluded='[data-e2e="browse-video-desc"],[data-e2e="video-desc"],[data-e2e*="comment"],[data-e2e="user-bio"],[data-e2e="browse-user-bio"]';
   const walker=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);
   let node,inspected=0;
   while((node=walker.nextNode())&&inspected++<5000){
@@ -85,6 +87,29 @@ class EvidenceQualityError(RuntimeError):
         super().__init__(message)
         self.code=code
 
+
+def finalize_capture_outcome(run, cancelled=False):
+    """Normalize collection outcome without inferring historical completeness."""
+    collection = run.setdefault('collection', {})
+    requested = collection.get('requested_sources') or collection.get('options', {}).get('sources', [])
+    details = collection.get('sources', {})
+    states = [details.get(source, {}).get('status', 'unassessed') for source in requested]
+    if cancelled:
+        run['status'] = 'cancelled'
+    elif not run.get('records'):
+        if states and all(state == 'observed_empty' for state in states):
+            run['status'] = 'observed_empty'
+            collection['last_capture_reason'] = 'No se observó evidencia en las secciones recorridas. El total histórico sigue siendo desconocido; no se afirma ausencia de actividad.'
+        else:
+            run['status'] = 'needs_attention' if collection.get('blockers') else 'unavailable'
+            collection['last_capture_reason'] = 'No se incorporó evidencia aceptable de las fuentes solicitadas. Revisa los estados y motivos de cada fuente; no se interpreta como un perfil vacío.'
+    elif any(state not in {'sampled', 'accessible'} for state in states):
+        run['status'] = 'partial'
+        collection['last_capture_reason'] = 'Se conservó una muestra parcial; alguna fuente no terminó o no aportó evidencia aceptable. El total histórico es desconocido.'
+    else:
+        run['status'] = 'completed'
+    return run['status']
+
 # Network/TLS hiccups that are worth a bounded retry. These are transient transport
 # failures, not anti-bot signals; the collector never bypasses a challenge.
 TRANSIENT_NAV_ERRORS = ('ERR_SSL_PROTOCOL_ERROR','ERR_CONNECTION_RESET','ERR_CONNECTION_CLOSED',
@@ -92,45 +117,24 @@ TRANSIENT_NAV_ERRORS = ('ERR_SSL_PROTOCOL_ERROR','ERR_CONNECTION_RESET','ERR_CON
                         'ERR_NETWORK_CHANGED','ERR_EMPTY_RESPONSE','ERR_HTTP2_PROTOCOL_ERROR',
                         'ERR_INTERNET_DISCONNECTED')
 
-CHROME_CANDIDATES = (r'C:\Program Files\Google\Chrome\Application\chrome.exe',
-                     r'C:\Program Files (x86)\Google\Chrome\Application\chrome.exe')
-
-def chrome_executable():
-    """Locate the installed Chrome; the collector only ever drives the browser."""
-    for path in CHROME_CANDIDATES:
-        if os.path.isfile(path):
-            return path
-    local=os.path.join(os.environ.get('LOCALAPPDATA',''),'Google','Chrome','Application','chrome.exe')
-    if local and os.path.isfile(local):
-        return local
-    found=shutil.which('chrome') or shutil.which('chrome.exe')
-    if found:
-        return found
-    raise NeedsAttention('No se encontró Chrome instalado en este equipo.','chrome_not_found')
-
-def open_login_browser(profile=''):
-    """Open a normal (non-automated) Chrome window sharing the app profile.
-
-    Login happens without any debugger attached, so TikTok's anti-automation
-    page is not triggered; the session is then reused by the automated capture.
-    """
-    url='https://www.tiktok.com/login' if not profile else 'https://www.tiktok.com/@' + profile
-    subprocess.Popen([chrome_executable(),'--user-data-dir=' + str(store.ROOT / '.browser-profile'),
-                      '--new-window',url], close_fds=True)
-
 class BrowserSession:
     def __init__(self):
         self.context = None
         self.playwright = None
         self.page = None
         self.headless = False
-        self.status = 'Cerrado. Abre Chrome e inicia sesión manualmente.'
+        self.session_mode = 'logged_in'
+        self.status = 'Chrome de Windows se conectará al analizar; acceso manual solo si TikTok lo pide.'
+        self.bridge = None
+        self.browser = None
         self.job = None
         self.captcha_wait_seconds = 0
 
     def state(self):
         return {'open':self.context is not None, 'status':self.status, 'headless':self.headless,
-                'profile_available':(store.ROOT/'.browser-profile'/'Default').is_dir()}
+                'session_mode':self.session_mode,
+                'profile_available':bool(self.bridge), 'identity':'HuellaBrowser · Windows · perfil dedicado',
+                'transport':'stdio · solo loopback'}
 
     def capture_diagnostic(self,run):
         """Bounded UI diagnostics; no body text, inputs, or cookies are returned."""
@@ -173,41 +177,50 @@ class BrowserSession:
             directory=store.DATA/'artifacts'/store.safe_id(run['id'])
             directory.mkdir(parents=True,exist_ok=True)
             path=directory/'capture-diagnostic.jpg'
-            page.screenshot(path=str(path),full_page=False,timeout=5000)
+            self.safe_page_screenshot(page,path)
             diagnostic['path']=store.relative(path)
+            diagnostic['overlay_guard_version']=1
         except Exception as exc:
             diagnostic['errors'].append({'stage':'screenshot','type':type(exc).__name__})
         return diagnostic
 
-    def open(self, profile='', headless=False):
-        if self.context is not None and self.headless != headless:
-            self.close()
+    def open(self, profile='', headless=False, session_mode='logged_in'):
+        # Legacy callers cannot switch to Linux Chrome, headless or incognito.
+        from app.windows_browser import WindowsChromeBridge, BridgeError
         if self.context is None:
             from playwright.sync_api import sync_playwright
             if self.playwright:
                 self.playwright.stop()
             self.playwright = sync_playwright().start()
             try:
-                self.context = self.playwright.chromium.launch_persistent_context(
-                    str(store.ROOT / '.browser-profile'), channel='chrome', headless=headless,
-                    viewport={'width':1440, 'height':1000}, locale='es-ES',
-                    accept_downloads=False)
+                self.bridge = WindowsChromeBridge()
+                endpoint = self.bridge.start()
+                self.browser = self.playwright.chromium.connect_over_cdp(endpoint, timeout=15000)
+                if not self.browser.contexts:
+                    raise NeedsAttention('Chrome no devolvió el contexto persistente dedicado.', 'persistent_context_missing')
+                self.context = self.browser.contexts[0]
             except Exception as exc:
-                self.playwright.stop()
-                self.playwright = None
-                raise NeedsAttention('No se pudo abrir Chrome porque el perfil está en uso. Cerrá con la X la ventana de Chrome que usaste para iniciar sesión (no la dejes abierta) y volvé a intentar. Si no hay ninguna abierta, revisá que Chrome esté instalado.','chrome_profile_locked') from exc
+                self.close()
+                if isinstance(exc, (BridgeError, NeedsAttention)):
+                    raise NeedsAttention(str(exc), exc.code) from None
+                raise NeedsAttention('No se pudo adjuntar Chrome de Windows al puente local. No se abrirá Chrome de Linux.', 'windows_cdp_connection_failed') from None
             self.context.on('close', self._closed)
-            self.headless=headless
-            self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+            self.headless=False
+            self.session_mode='logged_in'
+            # Only an app-created tab is controlled, never an ambient tab.
+            self.page = self.context.new_page()
             self.page.set_default_timeout(8000)
         if self.page is None or self.page.is_closed():
             self.page = self.context.new_page()
-        destination = 'https://www.tiktok.com/@' + profile if profile else 'https://www.tiktok.com/login'
-        self._goto(destination)
-        self.status = 'Sesión activa sin ventana.' if headless else 'Chrome abierto. Completa el inicio de sesión manual y luego inicia la captura.'
+        if profile:
+            destination = 'https://www.tiktok.com/@' + store.profile_name(profile)
+            if self.page.url != destination:
+                self._goto(destination)
+        self.page.bring_to_front()
+        self.status = 'Chrome de Windows conectado · HuellaBrowser · sesión persistente. No cierres la ventana para capturar.'
         return self.state()
 
-    def _goto(self, url, attempts=5):
+    def _goto(self, url, attempts=1):
         """Navigate, retrying transient network/TLS failures. Never bypasses anti-bot."""
         last = None
         for attempt in range(attempts):
@@ -220,33 +233,31 @@ class BrowserSession:
                 if attempt + 1 >= attempts or not transient:
                     break
                 time.sleep(2.0 * (attempt + 1))
-        raise NeedsAttention('No se pudo abrir TikTok en el navegador tras varios intentos. Revisa la conexión y vuelve a intentarlo.','navigation_failed') from last
+        raise NeedsAttention('No se pudo abrir TikTok en el navegador. El intento se detuvo; revisa la conexión antes de volver a analizar.', 'navigation_failed') from last
+
+    def show_access(self, profile=''):
+        """Keep the current challenge/login page intact for the human."""
+        if self.context and self.page and not self.page.is_closed():
+            self.page.bring_to_front()
+            return self.state()
+        return self.open(profile)
 
     def _closed(self, *_):
         self.context = None
         self.page = None
-        self.status = 'Chrome cerrado; la sesión permanece en el perfil local.'
+        self.status = 'Puente desconectado; Chrome y su sesión dedicada permanecen en Windows.'
 
     def close(self):
-        failure=None
-        try:
-            if self.context:
-                self.context.close()
-        except Exception as exc:
-            if type(exc).__name__!='TargetClosedError':
-                failure=exc
-        finally:
-            try:
-                if self.playwright:
-                    self.playwright.stop()
-            except Exception as exc:
-                if type(exc).__name__!='TargetClosedError' and failure is None:
-                    failure=exc
-            finally:
-                self.playwright=None
-                self._closed()
-        if failure is not None:
-            raise failure
+        # Disconnect only: closing the CDP default context is not supported.
+        # Leave the dedicated browser available for manual verification/login.
+        if self.bridge:
+            self.bridge.close()
+            self.bridge = None
+        if self.playwright:
+            self.playwright.stop()
+        self.playwright = None
+        self.browser = None
+        self._closed()
         return self.state()
 
     def text(self, page):
@@ -266,7 +277,7 @@ class BrowserSession:
             # This returns one boolean, never copies body text into evidence.
             return bool(scope.locator('body').evaluate(VERIFY_TEXT_CHECK,VERIFY_PATTERN,timeout=1500))
         except Exception:
-            return False
+            raise NeedsAttention('No se pudo comprobar si hay una verificación; captura detenida.','verification_unknown')
 
     def verification_visible(self,page):
         if self.visible(page.locator(CAPTCHA_SELECTOR)) is not None:
@@ -282,8 +293,8 @@ class BrowserSession:
                 element=frame.frame_element()
                 if element.is_visible() and self._challenge_text(frame):
                     return True
-            except Exception:
-                continue
+            except Exception as exc:
+                raise NeedsAttention('No se pudo verificar un marco visible; requiere revisión manual.','verification_unknown') from exc
         return False
 
     def wait_for_manual_verification(self, page, job=None):
@@ -299,6 +310,8 @@ class BrowserSession:
         active = job if job is not None else self.job
         waited = 0
         while waited < self.captcha_wait_seconds:
+            if active is not None and active.get('cancel_requested'):
+                return False
             if active is not None:
                 active['message'] = 'TikTok pide una verificación. Resuélvela en la ventana de Chrome; la captura seguirá sola.'
                 active['waiting_for_verification'] = True
@@ -315,11 +328,11 @@ class BrowserSession:
 
     def check_blockers(self, page):
         if self.verification_visible(page) and not self.wait_for_manual_verification(page):
-            raise NeedsAttention('TikTok muestra una verificación. Ábrela en una ventana (desactiva «Capturar sin ventana») y resuélvela; la captura continuará sola.','verification_required')
+            raise NeedsAttention('TikTok muestra una verificación. Captura detenida sin guardar el desafío. Resuélvela en HuellaBrowser y vuelve a pulsar Analizar; no cierres Chrome.', 'verification_required')
         text = self.text(page).lower()
         if any(x in text for x in ['no se encontró esta cuenta','couldn’t find this account',"couldn't find this account"]):
             raise NeedsAttention('TikTok no encontró este perfil. Comprueba el nombre.','profile_not_found')
-        if any(x in text for x in ['esta cuenta es privada','this account is private']):
+        if any(x in text for x in ['esta cuenta es privada','this account is private']) and not self.cards(page).count():
             raise NeedsAttention('El perfil es privado. Solo se recopila contenido público accesible.','private_profile')
         if any(x in text for x in ['too many requests','demasiadas solicitudes','access denied']):
             raise NeedsAttention('TikTok ha limitado el acceso. Captura detenida; no se intentará evadir el bloqueo.','rate_limited')
@@ -344,7 +357,36 @@ class BrowserSession:
             dismissed.append(label)
             page.wait_for_timeout(250)
         self.check_blockers(page)
+        if page.locator('body').evaluate(VERIFY_TEXT_CHECK,INTRO_PATTERN,timeout=1500):
+            raise NeedsAttention('Hay una introducción sobre el contenido. Ciérrala manualmente y vuelve a intentar; no se guardó ninguna imagen.','onboarding_required')
+        for pattern in DISMISS_LABELS:
+            if self.visible(page.get_by_role('button',name=re.compile(pattern,re.I))) is not None:
+                raise NeedsAttention('Un aviso sigue visible; ciérralo manualmente antes de capturar.','overlay_required')
+        if self.visible(page.locator('[role="dialog"], [aria-modal="true"]')) is not None:
+            raise NeedsAttention('Hay un diálogo sobre la página. Resuélvelo manualmente antes de capturar.','overlay_required')
         return dismissed
+
+    def safe_page_screenshot(self,page,path):
+        """Diagnostics follow the same blocker contract; no hidden-overlay bypass."""
+        self.prepare_page(page)
+        self.assert_screenshot_clear(page)
+        page.screenshot(path=str(path),full_page=False,timeout=5000)
+        try:
+            self.assert_screenshot_clear(page)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
+
+    def assert_screenshot_clear(self,page):
+        """Non-mutating final guard: never dismiss/wait after taking an image."""
+        if self.verification_visible(page):
+            raise NeedsAttention('Verificación visible; imagen omitida. Resuélvela manualmente.','verification_required')
+        if page.locator('body').evaluate(VERIFY_TEXT_CHECK,INTRO_PATTERN,timeout=1500):
+            raise NeedsAttention('Introducción visible; imagen omitida. Ciérrala manualmente.','onboarding_required')
+        if any(self.visible(page.get_by_role('button',name=re.compile(pattern,re.I))) is not None for pattern in DISMISS_LABELS):
+            raise NeedsAttention('Aviso visible; imagen omitida.','overlay_required')
+        if self.visible(page.locator('[role="dialog"], [aria-modal="true"]')) is not None:
+            raise NeedsAttention('Diálogo visible; imagen omitida.','overlay_required')
 
     def clean_screenshot(self,page,element,path,min_side=80):
         dismissed=self.prepare_page(page)
@@ -355,18 +397,22 @@ class BrowserSession:
         if not isinstance(quality,dict) or not quality.get('clear'):
             code=quality.get('reason','media_obscured') if isinstance(quality,dict) else 'quality_unknown'
             raise EvidenceQualityError('El medio está tapado, recortado o todavía no cargó; no se procesa esta imagen.',code)
+        self.prepare_page(page)
+        quality=element.evaluate(OCCLUSION_CHECK,min_side)
+        if not isinstance(quality,dict) or not quality.get('clear'):
+            raise EvidenceQualityError('El medio cambió antes de capturar; imagen omitida.')
+        self.assert_screenshot_clear(page)
         element.screenshot(path=str(path),timeout=5000)
         try:
-            self.check_blockers(page)
-        except NeedsAttention:
+            self.assert_screenshot_clear(page)
+            after=element.evaluate(OCCLUSION_CHECK,min_side)
+            if not isinstance(after,dict) or not after.get('clear'):
+                raise EvidenceQualityError('Apareció un elemento sobre el medio durante la captura; imagen descartada.')
+        except Exception:
             path.unlink(missing_ok=True)
             raise
-        after=element.evaluate(OCCLUSION_CHECK,min_side)
-        if not isinstance(after,dict) or not after.get('clear'):
-            path.unlink(missing_ok=True)
-            raise EvidenceQualityError('Apareció un elemento sobre el medio durante la captura; imagen descartada.')
         return dict(status='verified',source='profile_capture',observed_at=store.now(),
-                    crop='element',occlusion_checked=True,dismissed_overlays=dismissed,**quality)
+                    crop='element',occlusion_checked=True,overlay_guard_version=1,dismissed_overlays=dismissed,**quality)
 
     @staticmethod
     def issue(run,source,code,message,status='unavailable'):
@@ -387,8 +433,9 @@ class BrowserSession:
         try:
             directory.mkdir(parents=True,exist_ok=True)
             path=directory/f'{source}-diagnostic.jpg'
-            page.screenshot(path=str(path),full_page=False,timeout=4000)
+            self.safe_page_screenshot(page,path)
             run['collection'].setdefault('sources',{}).setdefault(source,{})['diagnostic_screenshot']=store.relative(path)
+            run['collection']['sources'][source]['overlay_guard_version']=1
         except Exception:
             pass
 
@@ -435,7 +482,7 @@ class BrowserSession:
         collection=run['collection']
         self.stage(run,source,'waiting_for_tab')
         tab=self.wait_tab(page,source)
-        if tab is None and not collection.get('profile_reload_attempted'):
+        if tab is None and getattr(self, 'allow_reload', False) and not collection.get('profile_reload_attempted'):
             collection['profile_reload_attempted']=True
             page.reload(wait_until='domcontentloaded',timeout=30000)
             tab=self.wait_tab(page,source)
@@ -458,7 +505,7 @@ class BrowserSession:
         page.wait_for_timeout(350)
         self.stage(run,source,'waiting_for_content')
         content=self.wait_source_content(page,source)
-        if content=='loading_timeout' and not collection.get('profile_reload_attempted'):
+        if content=='loading_timeout' and getattr(self, 'allow_reload', False) and not collection.get('profile_reload_attempted'):
             collection['profile_reload_attempted']=True
             page.reload(wait_until='domcontentloaded',timeout=30000)
             return self.select_source(page,run,source)
@@ -468,13 +515,14 @@ class BrowserSession:
             return False
         if content!='loaded':
             message='TikTok muestra una sección vacía.' if content=='empty_visible' else 'La pestaña se seleccionó pero su contenido no terminó de cargar. No se interpreta como una sección vacía.'
-            self.issue(run,source,content,message)
+            self.issue(run,source,content,message,'observed_empty' if content=='empty_visible' else 'unavailable')
             collection['sources'][source]['content_state']=content
             return False
         return True
 
     @staticmethod
     def prepare_record_frames(row):
+        row['ocr_sequence']=[]
         previous=row.get('availability')
         if isinstance(previous,dict) and previous:
             history=row.setdefault('availability_history',[])
@@ -491,7 +539,8 @@ class BrowserSession:
                 kept.append(path)
             else:
                 archived.append(path)
-                legacy=legacy or info.get('status')!='verified'
+                from app.analysis import safe_frame
+                legacy=legacy or not safe_frame(info)
         row['archived_frames']=list(dict.fromkeys(archived))
         row['frames']=kept
         row['frame_quality']={path:quality[path] for path in kept}
@@ -517,32 +566,64 @@ class BrowserSession:
             return
         run.setdefault('collection',{}).setdefault('issues',[]).append({
             'code':'login_required_for_sources',
-            'message':'No hay sesión iniciada en el navegador de la app. TikTok oculta '+ ' y '.join(labels[source] for source in gated) +' a quienes no iniciaron sesión; usá «Abrir sesión» e iniciá sesión una vez para verlas.',
+            'message':'Se observó un botón de acceso. La disponibilidad de '+ ' y '.join(labels[source] for source in gated) +' puede depender de la sesión o de la interfaz; no demuestra ausencia de contenido. Si TikTok exige acceso, complétalo manualmente en HuellaBrowser.',
             'observed_at':store.now()})
 
-    def capture(self, job:dict, run:dict, sources:list[str], max_items:int, scroll_rounds:int, mode:str='incremental',headless:bool=True,wait_captcha:bool=True):
+    def preview(self,profile,options,run=None):
+        """Explicit bounded DOM-only inspection: no screenshots, OCR, or AI."""
+        self.job=None
+        self.captcha_wait_seconds=0
+        result={'profile':profile,'observed_at':store.now(),'options':options,'sources':{},
+                'detected_tabs':[],
+                'count_basis':'Mínimo de enlaces visibles; no es un total del perfil.'}
+        if run is not None:
+            # Preserve completed source observations even if a later source fails.
+            run.setdefault('collection',{})['preview']=result
+        self.open(profile,False,options['session_mode'])
+        result['detected_tabs']=self.tabs_snapshot(self.page)
+        self.prepare_page(self.page)
+        scratch={'collection':{'sources':{}}}
+        for source in options['sources']:
+            if not self.select_source(self.page,scratch,source):
+                result['sources'][source]=scratch['collection']['sources'][source]
+                continue
+            seen=set()
+            rounds=min(3,max(1,options.get('preview_rounds',3)))
+            for turn in range(rounds):
+                self.prepare_page(self.page)
+                seen.update(self.cards(self.page).evaluate_all('els=>els.map(e=>e.href)'))
+                if turn<rounds-1:
+                    self.page.mouse.wheel(0,700)
+                    self.page.wait_for_timeout(700)
+            result['sources'][source]={'observed_minimum':len(seen),'status':'accessible','total':None}
+        return result
+
+    def capture(self, job:dict, run:dict, sources:list[str], max_items:int, scroll_rounds:int, mode:str='incremental',headless:bool=False,wait_captcha:bool=False,session_mode:str='logged_in'):
+        headless=False
+        session_mode='logged_in'
         self.job = job
-        self.captcha_wait_seconds = 240 if wait_captcha and not headless else 0
+        self.options=run.get('collection',{}).get('options',{})
+        self.captcha_wait_seconds = 0
         run.setdefault('collection',{}).setdefault('sources',{})
         profile_url = 'https://www.tiktok.com/@' + run['profile']
         run['collection'].update(headless=headless,profile_url=profile_url,requested_sources=list(sources),stage='opening_browser')
         try:
             opened=False
-            if not self.context or not self.page or self.page.is_closed() or self.headless != headless:
-                self.open(run['profile'],headless=headless)
+            if not self.context or not self.page or self.page.is_closed() or self.headless != headless or self.session_mode!=session_mode:
+                self.open(run['profile'],headless=headless,session_mode=session_mode)
                 opened=True
             page = self.page
             already_navigated=False
-            if opened:
-                try:
-                    already_navigated=store.profile_name(page.url)==run['profile']
-                except (ValueError,AttributeError):
-                    pass
-            if not already_navigated:
+            try:
+                already_navigated=store.profile_name(page.url)==run['profile']
+            except (ValueError,AttributeError):
+                pass
+            if not already_navigated and page.url != profile_url:
                 run['collection']['stage']='navigating_profile'
                 self._goto(profile_url)
             run['collection']['stage']='preparing_profile'
             page.wait_for_timeout(500)
+            run['collection']['detected_tabs']=self.tabs_snapshot(page)
             dismissed=self.prepare_page(page)
         except NeedsAttention as exc:
             for source in sources:
@@ -551,7 +632,13 @@ class BrowserSession:
         artifact_dir = store.DATA / 'artifacts' / run['id']
         artifact_dir.mkdir(parents=True, exist_ok=True)
         from app.profiles import known_records
-        planner = CapturePlan(run['profile'],known_records(run['profile']),mode,max_items)
+        known=known_records(run['profile'], migrate=not self.options.get('isolate_history',False))
+        for row in known.values():
+            if any(info.get('source')=='profile_capture' and info.get('overlay_guard_version')!=1 for info in (row.get('frame_quality') or {}).values()):
+                row['processing_status']='pending'
+            if row.get('date_filter_status') in {'outside_window','unknown_date'} and self.options.get('date_filter')!='last30days':
+                row['processing_status']='pending'
+        planner = CapturePlan(run['profile'],known,mode,max_items)
         run['collection'].update({'method':'visible_browser', 'sample_limit_per_source':max_items,
                                    'incremental':planner.stats,
                                    'headless':headless,'issues':[], 'dismissed_overlays':dismissed,
@@ -591,7 +678,9 @@ class BrowserSession:
             job.update(message=f'Leyendo {source}…', status='running')
             run['collection']['stage']='reading_source_'+source
             try:
-                if self.select_source(page,run,source):
+                if self.capture_structured_source(page,job,run,source,artifact_dir,planner,scroll_rounds):
+                    pass
+                elif self.select_source(page,run,source):
                     self._capture_source(page,job,run,source,sources,artifact_dir,planner,scroll_rounds)
                 else:
                     self.diagnostic_source(page,run,source,artifact_dir)
@@ -605,15 +694,31 @@ class BrowserSession:
                 self.issue(run,source,'source_capture_failed',f'La sección no pudo terminar de leerse en la etapa {stage} ({type(exc).__name__}); se conserva lo ya observado.')
                 self.diagnostic_source(page,run,source,artifact_dir)
             store.save_run(run)
-        run['status'] = 'cancelled' if job.get('cancel_requested') else 'completed'
-        if not job.get('cancel_requested') and not run['records'] and run['collection'].get('blockers'):
-            run['status']='needs_attention'
-            run['collection']['last_capture_reason']='No se logró leer ninguna sección solicitada. Revisa los diagnósticos y la sesión manual; no se interpreta como un perfil vacío.'
+        finalize_capture_outcome(run, job.get('cancel_requested',False))
         return run
+
+    def capture_structured_source(self,page,job,run,source,artifact_dir,planner,scroll_rounds):
+        from app.tiktok_feed import collect
+        if not hasattr(page, 'on'):
+            return False
+        before = len(run['records'])
+        try:
+            return collect(self,page,job,run,source,artifact_dir,planner,scroll_rounds)
+        except NeedsAttention:
+            raise
+        except Exception:
+            if len(run['records']) != before:
+                # Do not restart into the DOM after planning/processing evidence.
+                self.issue(run,source,'structured_capture_interrupted',
+                           'La lectura de datos se interrumpió; se conserva la muestra obtenida.', 'partial')
+                return True
+            run['collection']['sources'].setdefault(source,{})['structured_fallback']='structured_capture_unavailable'
+            return False
 
     def _capture_source(self,page,job,run,source,sources,artifact_dir,planner,scroll_rounds):
         self.stage(run,source,'reading_grid')
         found = {}
+        maximum_visible_cards = 0
         stagnant = 0
         stop_reason = 'scroll_limit'
         page.keyboard.press('Control+Home')
@@ -625,6 +730,7 @@ class BrowserSession:
             self.prepare_page(page)
             cards = self.cards(page)
             rows = cards.evaluate_all("els => els.map(e => ({url:e.href, alt:e.querySelector('img')?.alt || e.getAttribute('aria-label') || '', grid_metric:e.innerText, pinned:!!e.closest('[data-e2e=\"user-post-item\"]')?.innerText.match(/Fijado|Pinned/)}))")
+            maximum_visible_cards = max(maximum_visible_cards, len(rows))
             before = len(found)
             for card_index, item in enumerate(rows):
                 try:
@@ -642,6 +748,8 @@ class BrowserSession:
                 if plan is None:
                     continue
                 row,needs_processing = plan
+                from app.planning import date_eligibility
+                row['date_filter_status']=date_eligibility(row,run['collection'].get('options',{}))
                 found[url] = (row,needs_processing)
                 run['records'].append(row)
                 if not needs_processing:
@@ -684,18 +792,26 @@ class BrowserSession:
         planner.stats['stop_reasons'][source] = stop_reason
         overview = artifact_dir / f'{source}-grid.jpg'
         self.prepare_page(page)
-        page.screenshot(path=str(overview), full_page=False)
+        self.safe_page_screenshot(page,overview)
         prior=run['collection']['sources'].get(source,{})
-        run['collection']['sources'][source] = prior | {'status':('partial' if prior.get('issues') else 'sampled') if found else 'unavailable',
-            'count':len(found), 'diagnostic_screenshot':store.relative(overview), 'stop_reason':stop_reason,
-            'reason':'Rejilla revisada con límite; no garantiza todo el historial. Las ausencias no se interpretan como eliminación.' if found else 'Sin elementos cargados. Puede requerir sesión, otra versión de TikTok o más tiempo.'}
+        empty_status = 'unavailable' if maximum_visible_cards else 'observed_empty'
+        empty_reason = ('Se observaron tarjetas, pero no se incorporó ningún enlace aceptable dentro de la validación, el alcance y el presupuesto de este recorrido.'
+                        if maximum_visible_cards else 'No se observaron tarjetas durante este recorrido acotado.')
+        run['collection']['sources'][source] = prior | {'status':('partial' if prior.get('issues') else 'sampled') if found else empty_status,
+            'maximum_visible_cards':maximum_visible_cards,
+            'count':len(found), 'observed_minimum':len(found), 'overlay_guard_version':1, 'diagnostic_screenshot':store.relative(overview), 'stop_reason':stop_reason,
+            'reason':'Rejilla revisada con límite; no garantiza todo el historial. Las ausencias no se interpretan como eliminación.' if found else empty_reason + ' El total histórico y la actividad no observada siguen siendo desconocidos.'}
         work = [row for row,needs_processing in found.values() if needs_processing]
+        from app.planning import date_eligibility
+        for row,_ in found.values():
+            row['date_filter_status']=date_eligibility(row,run['collection'].get('options',{}))
         store.save_run(run)
         if not work:
             return
         # A separate tab keeps the selected source and scroll position intact.
         detail = self.context.new_page()
         detail.set_default_timeout(6000)
+        keep_for_manual = False
         try:
             for index, row in enumerate(work):
                 if job.get('cancel_requested'):
@@ -706,10 +822,14 @@ class BrowserSession:
                 try:
                     self.stage(run,source,'extracting_detail')
                     complete=self.capture_detail(detail, row, artifact_dir)
+                    from app.planning import date_eligibility
+                    row['date_filter_status']=date_eligibility(row,run['collection'].get('options',{}))
                     planner.finish(row,complete is not False)
                     if complete is False:
                         self.record_detail_issue(run,row,source,'primary_media_not_found','No se pudo aislar el medio principal; solo se conserva evidencia recortada verificable.')
                 except NeedsAttention as exc:
+                    keep_for_manual = True
+                    self.page = detail
                     planner.finish(row,False)
                     self.record_detail_issue(run,row,source,exc.code,str(exc))
                     row.update(protected)
@@ -722,7 +842,17 @@ class BrowserSession:
                 row.update(protected)
                 store.save_run(run)
         finally:
-            detail.close()
+            if keep_for_manual:
+                detail.bring_to_front()
+            else:
+                detail.close()
+            details=run['collection']['sources'].setdefault(source,{})
+            from app.planning import date_eligibility
+            for row,_ in found.values():
+                row['date_filter_status']=date_eligibility(row,run['collection'].get('options',{}))
+            details['observed_minimum']=len(found)
+            details['date_excluded_count']=sum(row.get('date_filter_status')=='outside_window' for row,_ in found.values())
+            details['unknown_date_count']=sum(row.get('date_filter_status')=='unknown_date' for row,_ in found.values())
 
     def record_detail_issue(self,run,row,source,code,message):
         availability=row.setdefault('availability',{'status':'partial','issues':[]})
@@ -799,9 +929,17 @@ class BrowserSession:
         if music.count():
             row['music'] = {'title':music.first.inner_text()[:500], 'author':'', 'url':music.first.get_attribute('href'), 'source':'visible_link'}
         visible_date = field('[data-e2e="browser-nickname"], [data-e2e="video-create-time"], time')
-        row['published_at'] = parse_visible_date(visible_date)
-        row['published_date_raw'] = visible_date
-        row['published_date_source'] = 'visible' if row['published_at'] else None
+        if 'published_at' not in (row.get('manual_fields') or {}):
+            row['published_at'] = parse_visible_date(visible_date)
+            row['published_date_raw'] = visible_date
+            row['published_date_source'] = 'visible' if row['published_at'] else None
+        from app.planning import date_eligibility
+        row['date_filter_status']=date_eligibility(row,getattr(self,'options',{}))
+        if row['date_filter_status']!='included':
+            row['frames']=[]
+            row['frame_quality']={}
+            row['notes'].append('Filtro de 30 días: fecha desconocida o fuera de la ventana; observación conservada, excluida de OCR, Gemini y análisis filtrado.')
+            return True
         row['hashtags'] = re.findall(r'#[\w]+', row['caption'], re.UNICODE)
         for name, selector in {'likes':'like-count','comments':'comment-count','shares':'share-count','saves':'collect-count'}.items():
             raw = field(f'[data-e2e="{selector}"]')
@@ -809,10 +947,11 @@ class BrowserSession:
                 row['metrics'][name] = {'raw':raw, 'observed_at':row['observed_at']}
         output = directory / row['id']
         output.mkdir(exist_ok=True)
-        full = output / 'page.jpg'
+        full = output / ('page-' + uuid.uuid4().hex + '.jpg')
         self.prepare_page(page)
-        page.screenshot(path=str(full), full_page=False)
+        self.safe_page_screenshot(page,full)
         row.setdefault('diagnostic_screenshots',[]).append(store.relative(full))
+        row.setdefault('diagnostic_quality',{})[store.relative(full)]={'overlay_guard_version':1}
         if row['availability']['status']=='unavailable':
             return True
         # Multiple rendered frames retain scene context. Audio needs a provided media file.
@@ -820,16 +959,29 @@ class BrowserSession:
         row.setdefault('frame_quality',{})
         if video is not None:
             duration = video.evaluate('e => Number.isFinite(e.duration) ? e.duration : 0')
-            for i in range(3):
+            seen_frames=set()
+            offsets=sorted(set(max(0,min(duration-0.1,duration*fraction)) for fraction in (0,0.05,0.25,0.5,0.75,0.95,1))) if duration>0 else [0]
+            row['ocr_sequence']=[]
+            for i,offset in enumerate(offsets):
                 if duration > 0:
-                    video.evaluate('(e,t) => {e.pause(); e.currentTime=t;}', min(duration - 0.1, duration * (i + 1) / 4))
+                    video.evaluate('''(e,t) => new Promise((resolve,reject)=>{
+                        e.pause();
+                        if(Math.abs(e.currentTime-t)<0.05&&!e.seeking){resolve();return;}
+                        const timer=setTimeout(()=>{e.removeEventListener('seeked',done);reject(new Error('seek_timeout'));},3000);
+                        function done(){clearTimeout(timer);resolve();}
+                        e.addEventListener('seeked',done,{once:true});e.currentTime=t;
+                    })''', offset)
                     page.wait_for_timeout(400)
                 if not self.same_post(page.url,row):
                     raise ValueError('El reproductor cambió de publicación.')
                 target = output / f'frame-{i+1}.jpg'
                 quality=self.clean_screenshot(page,video,target)
+                digest=hashlib.sha256(target.read_bytes()).hexdigest()
+                if digest in seen_frames:
+                    continue
+                seen_frames.add(digest)
                 relative=store.relative(target)
-                row['frame_quality'][relative]=quality | {'kind':'video_frame'}
+                row['frame_quality'][relative]=quality | {'kind':'video_frame','offset_seconds':round(offset,3)}
                 if relative not in row['frames']:
                     row['frames'].append(relative)
                 frame_paths.append(target)
@@ -870,6 +1022,9 @@ class BrowserSession:
                 row['frames'].append(store.relative(target))
             if result.get('ocr_text') and result['ocr_text'] not in texts:
                 texts.append(result['ocr_text'])
+                info=row['frame_quality'].get(store.relative(target),{})
+                row.setdefault('ocr_sequence',[]).append({'frame':store.relative(target),
+                    'offset_seconds':info.get('offset_seconds'),'slide_index':info.get('slide_index'), 'text':result['ocr_text']})
             row['notes'].extend(result.get('notes', []))
         if texts:
             row['ocr_text'] = '\n\n'.join(texts)

@@ -11,7 +11,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = Path(os.environ.get('HUELLA_DATA_DIR', str(ROOT / 'data'))).resolve()
+_data_path = Path(os.environ.get('HUELLA_DATA_DIR', 'data')).expanduser()
+DATA = (_data_path if _data_path.is_absolute() else ROOT / _data_path).resolve()
 LOCK = threading.RLock()
 
 def now() -> str:

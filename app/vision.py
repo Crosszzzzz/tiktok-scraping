@@ -1,4 +1,4 @@
-"""Bounded visual analysis through local Ollama or opt-in Gemini REST.
+"""Bounded visual analysis through opt-in Gemini REST, or disabled/OCR-only.
 
 Gemini contract: https://ai.google.dev/api/generate-content and
 https://ai.google.dev/gemini-api/docs/structured-output . No SDK is required.
@@ -16,35 +16,27 @@ import json
 import os
 from pathlib import Path
 import re
-import tempfile
 import threading
 import time
 from urllib import error, request
 import uuid
 
 from . import store
-from .media import describe_frames
 
 
-DEFAULT_MODEL = "gemini-3.8-flash"
-# Ordered fallback chain for one free-tier account. If the configured model is
-# deprecated (404), out of quota (429) or overloaded (5xx), the next candidate is
-# tried so the app keeps working without another account.
-FALLBACK_MODELS = ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash",
-                   "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-flash-lite-latest")
-# Only transient/availability errors justify trying another model. Config or key
-# problems (401/403, connection, invalid response) will not be fixed by a fallback.
-# "connection_error" is included so a single model timing out or dropping the socket
-# moves to the next candidate instead of aborting the whole chain.
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+# Availability, quota and pricing are account-specific. Never substitute models.
+FALLBACK_MODELS = ()  # No model substitution or silent cost escalation.
+# Kept for compatibility with the bounded request helper; there is only one candidate.
 _FALLBACK_CODES = frozenset({"http_404", "http_429", "http_500", "http_502", "http_503", "http_504", "connection_error"})
-PIPELINE_VERSION = "huella-visual-v1"
+PIPELINE_VERSION = "huella-visual-v2-safe-context"
 MAX_FRAMES = 4
 MAX_EDGE = 1024
 MAX_RESPONSE_BYTES = 256 * 1024
 _LOCK = threading.RLock()
 _ANALYZE_LOCK = threading.RLock()
 _MEMORY_KEYS: dict[str, str] = {}
-_DEFAULTS = {"provider": "local", "model": DEFAULT_MODEL, "auto_visual": False, "max_per_run": 10}
+_DEFAULTS = {"provider": "disabled", "model": DEFAULT_MODEL, "auto_visual": False, "max_per_run": 10}
 _USAGE_FIELDS = ("requests", "prompt_tokens", "output_tokens", "total_tokens", "cached_hits")
 _TOKEN_FIELDS = {"prompt_tokens": "promptTokenCount", "output_tokens": "candidatesTokenCount", "total_tokens": "totalTokenCount"}
 
@@ -121,11 +113,14 @@ def _atomic_json(path, value):
 def _config():
     raw = _read_json(_config_path(), 64 * 1024)
     result = dict(_DEFAULTS)
-    if isinstance(raw.get("provider"), str) and raw["provider"] in {"local", "gemini"}:
+    if isinstance(raw.get("provider"), str) and raw["provider"] in {"disabled", "gemini"}:
         result["provider"] = raw["provider"]
     model = _text(raw.get("model"), 101)
     if re.fullmatch(r"gemini-[a-zA-Z0-9_.-]{1,90}", model):
         result["model"] = model
+    environment_model = _text(os.getenv('GEMINI_MODEL'), 101)
+    if re.fullmatch(r"gemini-[a-zA-Z0-9_.-]{1,90}", environment_model):
+        result['model'] = environment_model
     if isinstance(raw.get("auto_visual"), bool):
         result["auto_visual"] = raw["auto_visual"]
     if isinstance(raw.get("max_per_run"), int) and not isinstance(raw["max_per_run"], bool) and 1 <= raw["max_per_run"] <= 50:
@@ -183,17 +178,17 @@ def _secret(config):
     return "", "none"
 
 
-def _usage():
-    raw = _read_json(store.DATA / "config" / "ai-usage.json", 64 * 1024)
+def _usage(path=None):
+    raw = _read_json(path or store.DATA / "config" / "ai-usage.json", 64 * 1024)
     return {field: raw.get(field, 0) if type(raw.get(field, 0)) is int and raw.get(field, 0) >= 0 else 0 for field in _USAGE_FIELDS}
 
 
-def _track_usage(**increments):
+def _track_usage(*, path=None, **increments):
     with _LOCK:
-        totals = _usage()
+        totals = _usage(path)
         for field in _USAGE_FIELDS:
             totals[field] += max(0, int(increments.get(field, 0)))
-        _atomic_json(store.DATA / "config" / "ai-usage.json", totals)
+        _atomic_json(path or store.DATA / "config" / "ai-usage.json", totals)
 
 
 def get_settings():
@@ -201,11 +196,9 @@ def get_settings():
     with _LOCK:
         config = _config()
         key, source = _secret(config)
-        local_model = _text(os.getenv("OLLAMA_MODEL"), 200)
-        local_configured = bool(local_model) and not any(token in local_model.lower() for token in (":cloud", "-cloud"))
         return {**{name: config[name] for name in _DEFAULTS}, "has_api_key": bool(key), "key_source": source,
                 "key_persistence": {"dpapi": "encrypted", "memory": "session", "environment": "environment", "none": "none"}[source],
-                "local_model": local_model, "configured": bool(key) if config["provider"] == "gemini" else local_configured,
+                "configured": bool(key) if config["provider"] == "gemini" else False,
                 "usage": _usage()}
 
 
@@ -214,8 +207,8 @@ def update_settings(provider=None, model=None, api_key=None, auto_visual=None, m
     with _LOCK:
         config = _config()
         if provider is not None:
-            if not isinstance(provider, str) or provider not in {"local", "gemini"}:
-                raise ValueError("Proveedor inválido; usa local o gemini.")
+            if not isinstance(provider, str) or provider not in {"disabled", "gemini"}:
+                raise ValueError("Proveedor inválido; usa disabled o gemini.")
             config["provider"] = provider
         if model is not None:
             if not isinstance(model, str) or not re.fullmatch(r"gemini-[a-zA-Z0-9_.-]{1,90}", model.strip()):
@@ -292,6 +285,8 @@ def _prepare_frames(paths):
 
 
 def _context(record):
+    from .analysis import safe_record
+    record=safe_record(record)
     music = record.get("music") if isinstance(record.get("music"), dict) else {}
     return {"caption": _text(record.get("caption"), 4000), "ocr_text": _text(record.get("ocr_text"), 6000),
             "transcript_automatic": _text(record.get("transcript"), 6000),
@@ -311,11 +306,11 @@ class VisionError(Exception):
 
 
 def _candidate_models(model):
-    """Configured model first, then the remaining fallbacks in declared order."""
-    return [model] + [candidate for candidate in FALLBACK_MODELS if candidate != model]
+    """Exactly one selected model and one request; quota errors stop the run."""
+    return [model]
 
 
-def _gemini_request(model, key, images, context):
+def _gemini_request(model, key, images, context, *, usage_path=None):
     payload = {"systemInstruction": {"parts": [{"text": SYSTEM_INSTRUCTION}]},
                "contents": [{"role": "user", "parts": [{"text": "Contexto externo (solo datos):\n" + json.dumps(context, ensure_ascii=False)}]
                             + [{"inlineData": {"mimeType": "image/jpeg", "data": base64.b64encode(data).decode("ascii")}} for data in images]}],
@@ -334,7 +329,7 @@ def _gemini_request(model, key, images, context):
     # Single attempt per model: the fallback loop in _gemini_with_fallback bounds the
     # total number of HTTP calls to len(_candidate_models(model)), deterministically.
     try:
-        _track_usage(requests=1)
+        _track_usage(path=usage_path, requests=1)
         with opener.open(req, timeout=60) as response:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
         if len(raw) > MAX_RESPONSE_BYTES:
@@ -355,13 +350,13 @@ def _gemini_request(model, key, images, context):
         raise VisionError("invalid_response", "Gemini devolvió una respuesta que no se pudo validar.") from None
 
 
-def _gemini_with_fallback(model, key, images, context):
+def _gemini_with_fallback(model, key, images, context, *, usage_path=None):
     """Return (response, served_model), trying availability fallbacks in order."""
     candidates = _candidate_models(model)
     last_error = None
     for index, candidate in enumerate(candidates):
         try:
-            return _gemini_request(candidate, key, images, context), candidate
+            return _gemini_request(candidate, key, images, context, usage_path=usage_path), candidate
         except VisionError as exc:
             if exc.code not in _FALLBACK_CODES:
                 raise
@@ -416,7 +411,7 @@ def _redact(value, secret):
     return value
 
 
-def analyze_record(record, frame_paths, force=False):
+def analyze_record(record, frame_paths, force=False, *, runtime_directory=None, provider=None):
     """Return an evidence patch, or sanitized failure without overwriting existing evidence.
 
 Caller selects unobstructed evidence and enforces the per-run auto-visual budget.
@@ -435,21 +430,39 @@ This function never sends audio/video files, downloads content or follows links.
             raise VisionError("no_frames", "No hay fotogramas válidos para analizar.")
         with _ANALYZE_LOCK:
             config = _config()
+            # An explicitly authorized one-shot acceptance can keep all usage
+            # and cache writes in its own artifact directory, without changing
+            # persistent provider settings or reading/exporting browser state.
+            usage_path = None
+            cache_root = store.DATA / 'cache' / 'vision'
+            if runtime_directory is not None:
+                runtime_directory = Path(runtime_directory).resolve()
+                if not runtime_directory.is_relative_to((store.DATA / 'artifacts').resolve()):
+                    raise ValueError('Runtime directory must stay inside artifacts')
+                usage_path = runtime_directory / 'usage.json'
+                cache_root = runtime_directory / 'cache'
+            if provider is not None:
+                if provider not in {'disabled', 'gemini'}:
+                    raise ValueError('Unsupported provider')
+                config['provider'] = provider
             provider = config["provider"]
-            model = config["model"] if provider == "gemini" else _text(os.getenv("OLLAMA_MODEL"), 200)
+            if provider != 'gemini':
+                raise VisionError('disabled', 'Interpretación visual desactivada; OCR local disponible.')
+            model = config['model']
             context = _context(record)
             identity = {"provider": provider, "model": model, "pipeline": PIPELINE_VERSION, "context": context,
                         "images": [hashlib.sha256(data).hexdigest() for data in images]}
             fingerprint = hashlib.sha256(json.dumps(identity, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-            cache_path = store.DATA / "cache" / "vision" / (fingerprint + ".json")
+            cache_path = cache_root / (fingerprint + '.json')
             cached = _read_json(cache_path) if not force else {}
             prior = record.get("visual_analysis")
             if not force and isinstance(prior, dict) and prior.get("input_fingerprint") == fingerprint and _text(record.get("visual_summary")):
                 cached = {"visual_summary": record["visual_summary"], "visual_analysis": prior}
             cached_analysis = cached.get("visual_analysis")
             if isinstance(cached_analysis, dict) and cached_analysis.get("input_fingerprint") == fingerprint and _text(cached.get("visual_summary")):
-                _track_usage(cached_hits=1)
+                _track_usage(path=usage_path, cached_hits=1)
                 result = copy.deepcopy(cached)
+                result['visual_analysis']['safe_input_paths']=[store.relative(path) for path in frame_paths]
                 result["visual_analysis"]["cached"] = True
                 result["visual_analysis"]["original_usage"] = result["visual_analysis"].get("original_usage", result["visual_analysis"].get("usage", {name: 0 for name in _TOKEN_FIELDS}))
                 result["visual_analysis"]["usage"] = {name: 0 for name in _TOKEN_FIELDS}
@@ -461,9 +474,9 @@ This function never sends audio/video files, downloads content or follows links.
             if provider == "gemini":
                 if not key:
                     raise VisionError("missing_key", "Configura una clave de Gemini antes de usar el análisis visual en la nube.")
-                response, served_model = _gemini_with_fallback(model, key, images, context)
+                response, served_model = _gemini_with_fallback(model, key, images, context, usage_path=usage_path)
                 usage = _tokens(response)
-                _track_usage(**usage)
+                _track_usage(path=usage_path, **usage)
                 candidates = response.get("candidates")
                 if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
                     raise VisionError("no_candidate", "Gemini no devolvió contenido analizable; puede haber aplicado un filtro o no disponer de contexto suficiente.")
@@ -479,25 +492,9 @@ This function never sends audio/video files, downloads content or follows links.
                 version = _text(response.get("modelVersion"), 120) or served_model
                 if served_model != model:
                     notes.append(f"El modelo configurado no estaba disponible; se usó {served_model}.")
-            else:
-                if not model:
-                    raise VisionError("missing_local_model", "Configura OLLAMA_MODEL para usar un modelo visual local.")
-                with tempfile.TemporaryDirectory(prefix="huella-vision-") as temporary:
-                    paths = []
-                    for index, data in enumerate(images):
-                        path = Path(temporary) / f"frame-{index + 1}.jpg"
-                        path.write_bytes(data)
-                        paths.append(path)
-                    local = describe_frames(paths, context=json.dumps(context, ensure_ascii=False))
-                if not _text(local.get("visual_summary")):
-                    raise VisionError("local_unavailable", "Ollama no devolvió un análisis visual. Revisa el modelo local de visión y su conexión.")
-                summary = _text(local["visual_summary"])
-                output = {"summary": summary, "observations": [summary], "cultural_context": [], "visible_text": [],
-                          "uncertainties": ["Resumen local sin extracción estructurada de contexto cultural; requiere revisión visual."]}
-                notes.extend(_string_list(local.get("notes", [])))
-                version = model
             summary = output.pop("summary")
             analysis = {**output, "provider": provider, "model": served_model, "model_version": version,
+                        "safe_input_paths": [store.relative(path) for path in frame_paths],
                         "input_fingerprint": fingerprint, "pipeline_version": PIPELINE_VERSION,
                         "usage": usage, "frame_count": len(images), "cached": False}
             notes.extend([f"Se analizaron {len(images)} fotogramas reducidos; pueden faltar escenas o textos intermedios.",

@@ -1,5 +1,7 @@
 (() => {
   'use strict';
+  // The historical dashboard is inert in the guided UI; never autoload its data.
+  if (!document.querySelector('.sidebar')) return;
   const $ = (id) => document.getElementById(id);
   const sourceNames = { uploads: 'Publicación', reposts: 'Compartido', likes: 'Me gusta', manual: 'Importado' };
   const state = { run: null, app: null, job: null, timeline: 'interaction', page: 1, filterIds: null, filterLabel: '', polling: false, loading: false, jobProfile: null, formProfile: null, selectionVersion: 0, ai: null };
@@ -46,11 +48,11 @@
     if (!path || path.split('/').includes('..') || /^[a-z]:/i.test(path) || path.includes('\0')) return null;
     return '/data/' + path.split('/').map(encodeURIComponent).join('/');
   }
-  function verifiedFrames(record) { return list(record.frames).filter((path) => record.frame_quality?.[path]?.status === 'verified'); }
-  function diagnosticImages(record) { const approved = new Set(verifiedFrames(record)); return [...new Set([...list(record.diagnostic_screenshots), ...list(record.screenshots), ...list(record.archived_frames), ...list(record.frames).filter((path) => !approved.has(path))])]; }
+  function verifiedFrames(record) { return list(record.frames).filter((path) => { const info = record.frame_quality?.[path]; return info?.status === 'verified' && (info.source !== 'profile_capture' || info.overlay_guard_version === 1); }); }
+  function diagnosticImages(record) { return list(record.diagnostic_screenshots).filter((path) => record.diagnostic_quality?.[path]?.overlay_guard_version === 1); }
   function captureDiagnostic(info, label = 'captura') {
     if (!info || typeof info !== 'object') return null;
-    const path = mediaUrl(info.diagnostic_screenshot || info.screenshot || info.path);
+    const path = info.overlay_guard_version === 1 ? mediaUrl(info.diagnostic_screenshot || info.screenshot || info.path) : null;
     if (!path && !info.stage && !info.session_signal) return null;
     const details = el('details', 'capture-diagnostic');
     append(details, el('summary', '', 'Diagnóstico de ' + label), el('p', 'muted', 'Referencia técnica de este intento de captura; no se incluye en las evidencias del perfil.'));
@@ -108,16 +110,16 @@
       const opened = Boolean(data.browser?.open), headless = Boolean(data.browser?.headless);
       $('browser-badge').textContent = opened ? (headless ? 'Sin ventana' : 'Sesión abierta') : 'Navegador cerrado'; $('browser-badge').classList.toggle('good', opened);
       $('session-button').textContent = opened && !headless ? '↗ Ver sesión' : '↗ Abrir sesión'; $('close-session').hidden = !opened;
-      $('session-hint').textContent = opened && headless ? 'Captura en segundo plano. Cuando se detenga, Abrir sesión permite resolver el acceso manualmente.' : opened ? 'Completa el inicio de sesión en la ventana del navegador y vuelve aquí para iniciar la captura. Las secciones privadas se marcan como no disponibles.' : 'Abre la sesión e inicia sesión manualmente la primera vez. Después, inicia la captura. Solo se recopila lo que tu navegador puede ver.';
+      $('session-hint').textContent = `Modo ${data.browser?.session_mode === 'logged_in' ? 'sesión dedicada' : 'anónimo'}. No necesitas iniciar sesión para intentar contenido público. Si TikTok exige acceso o verificación, resuélvelo manualmente. Las superposiciones nunca son evidencia.`;
       renderProfiles(data.profiles); renderRuns(data.runs);
       const capabilities = $('capabilities'); capabilities.replaceChildren();
-      [['ocr', 'OCR'], ['opencv', 'OpenCV'], ['whisper', 'Audio'], ['ollama', 'Visión local']].forEach(([key, name]) => {
+      [['ocr', 'OCR'], ['opencv', 'OpenCV'], ['whisper', 'Audio opcional']].forEach(([key, name]) => {
         const item = el('span', 'capability' + (data.capabilities?.[key] ? ' available' : ''), name);
         item.title = data.capabilities?.[key] ? `${name} disponible` : `${name} no disponible; consulta la configuración local`;
         capabilities.append(item);
       });
       const currentJob = list(data.jobs).find(isActive);
-      $('session-button').disabled = Boolean(currentJob); $('close-session').disabled = Boolean(currentJob);
+      $('session-button').disabled = Boolean(currentJob); $('close-session').disabled = Boolean(currentJob); $('login-button').disabled = Boolean(currentJob); $('preflight-button').disabled = Boolean(currentJob);
       if (currentJob && !state.polling) startPolling(currentJob);
       return data;
     } catch (error) {
@@ -147,7 +149,28 @@
     $('capture-button').textContent = refresh ? 'Actualizar y revisar conocidos' : 'Actualizar: solo nuevos';
     $('max-items-label').textContent = refresh ? 'A procesar por sección' : 'Nuevos por sección';
     $('capture-mode-hint').textContent = refresh ? 'Reprocesa también el detalle de elementos conocidos dentro de los límites elegidos. Conserva el archivo acumulado.' : 'Recorre la cuadrícula para encontrar novedades y reintenta capturas fallidas. Reutiliza el contexto de elementos conocidos; una captura parcial no elimina el historial.';
-    $('capture-options-summary').textContent = `· ${$('capture-headless').checked ? 'sin ventana' : 'con ventana · espera verificación'} · ${$('max-items').value} por sección`;
+    const depth = $('capture-depth').value;
+    const limit = ({quick: 5, deep: 60, all: 200})[depth] || $('max-items').value;
+    $('capture-options-summary').textContent = `· ${$('capture-headless').checked ? 'sin ventana' : 'con ventana · espera verificación'} · ${limit} por sección`;
+  }
+  function renderExecutive(report) {
+    const target = $('executive-report'); target.replaceChildren();
+    target.hidden = !report;
+    if (!report) return;
+    append(target, el('h2', '', 'Resumen ejecutivo'), el('p', 'summary-text', report.summary));
+    const coverage = el('ul', 'thematic-profile');
+    list(report.coverage).forEach((item) => coverage.append(el('li', '', `${sourceNames[item.source] || item.source}: ${item.observed} observados · ${item.analyzed} con texto analizable · ${item.visual_analyzed} con visión · ${item.unknown_publication_dates} sin fecha original · ${item.excluded_by_date} fuera de ventana · ${item.unknown_date_filter} sin fecha para el filtro · ${item.status}. Total histórico desconocido.`)));
+    target.append(coverage);
+    list(report.themes).forEach((theme) => {
+      const line = el('p', 'summary-text', `${theme.name} (${theme.count}): `);
+      list(theme.evidence).forEach((item) => { const link = externalLink(item.url, item.id + ' ↗', 'text-button'); if (link) append(line, link, document.createTextNode(' ')); else line.append(document.createTextNode(item.id + ' ')); });
+      target.append(line);
+    });
+    target.append(el('p', 'muted', report.date_provenance));
+    const limits = el('details'); limits.append(el('summary', '', 'Límites y próximos pasos'));
+    const items = el('ul', 'thematic-profile');
+    [...list(report.limitations), ...list(report.next_steps)].forEach((item) => items.append(el('li', '', item)));
+    limits.append(items); target.append(limits);
   }
   function fillProfile(config) {
     const settings = { ...(config.settings || {}), ...config };
@@ -162,7 +185,10 @@
     $('max-items').value = maxItems;
     $('scroll-rounds').value = number(settings.scroll_rounds, 12);
     $('capture-mode').value = settings.mode === 'refresh' ? 'refresh' : 'incremental';
-    $('capture-headless').checked = settings.headless !== false;
+    $('capture-headless').checked = settings.headless === true;
+    $('capture-depth').value = settings.depth || 'quick';
+    $('session-mode').value = settings.session_mode || 'anonymous';
+    $('date-filter').value = settings.date_filter || 'any';
     const avatarPath = mediaUrl(settings.avatar_path || settings.avatar_url);
     $('profile-avatar-preview').hidden = !avatarPath;
     if (avatarPath) $('profile-avatar-preview').src = avatarPath;
@@ -175,7 +201,8 @@
     if (!profile) throw new Error('Escribe un usuario o una URL de perfil de TikTok.');
     if (!sources.length) throw new Error('Selecciona al menos una sección para capturar.');
     if (!$('scroll-rounds').checkValidity()) throw new Error('El límite de desplazamientos debe estar entre 1 y 50.');
-    return { profile, label: $('profile-label').value.trim(), notes: $('profile-notes').value.trim(), tags: $('profile-tags').value.split(',').map((tag) => tag.trim()).filter(Boolean), sources, max_items: Number($('max-items').value), scroll_rounds: Number($('scroll-rounds').value), mode: $('capture-mode').value, headless: $('capture-headless').checked };
+    if ($('date-filter').value === 'last30days' && (sources.length !== 1 || sources[0] !== 'uploads')) throw new Error('Últimos 30 días requiere solo Publicaciones; compartidos y Me gusta no tienen fecha de acción verificable.');
+    return { profile, label: $('profile-label').value.trim(), notes: $('profile-notes').value.trim(), tags: $('profile-tags').value.split(',').map((tag) => tag.trim()).filter(Boolean), sources, max_items: Number($('max-items').value), scroll_rounds: Number($('scroll-rounds').value), mode: $('capture-mode').value, headless: $('capture-headless').checked, depth: $('capture-depth').value, date_filter: $('date-filter').value, session_mode: $('session-mode').value };
   }
   async function saveProfile() {
     const payload = profilePayload();
@@ -207,16 +234,16 @@
   }
   function renderAiSettings(settings) {
     state.ai = settings;
-    $('ai-provider').value = settings.provider === 'gemini' ? 'gemini' : 'local';
-    $('ai-model').value = settings.model || 'gemini-3.8-flash';
+    $('ai-provider').value = settings.provider === 'gemini' ? 'gemini' : 'disabled';
+    $('ai-model').value = settings.model || 'gemini-3.5-flash-lite';
     $('ai-key').value = '';
     $('ai-auto-visual').checked = Boolean(settings.auto_visual);
     $('ai-max-per-run').value = number(settings.max_per_run, 10);
     const cloud = settings.provider === 'gemini';
-    $('ai-settings-summary').textContent = '· ' + (cloud ? 'Gemini' : 'Local') + (settings.configured ? ' configurado' : ' pendiente de configurar');
+    $('ai-settings-summary').textContent = '· ' + (cloud ? 'Gemini' : 'Solo OCR') + (settings.configured ? ' configurado' : '');
     const usage = settings.usage || {};
     const keyStatus = settings.has_api_key ? ({ encrypted: 'Clave guardada cifrada en este equipo', session: 'Clave disponible durante esta sesión', environment: 'Clave configurada en el entorno' }[settings.key_persistence] || 'Clave disponible') : 'Sin clave de Gemini';
-    $('ai-settings-status').textContent = `${keyStatus}. ${cloud ? (settings.configured ? 'Gemini listo.' : 'Añade una clave para usar Gemini.') : 'Modelo local: ' + (settings.local_model || 'según configuración del servidor') + '.'} Uso registrado: ${number(usage.requests)} solicitudes · ${number(usage.total_tokens)} tokens · ${number(usage.cached_hits)} resultados reutilizados.`;
+    $('ai-settings-status').textContent = `${keyStatus}. ${cloud ? (settings.configured ? 'Gemini configurado; disponibilidad y coste dependen de tu cuenta.' : 'Añade una clave para usar Gemini.') : 'Interpretación visual desactivada; OCR permanece local.'} Uso registrado: ${number(usage.requests)} solicitudes · ${number(usage.total_tokens)} tokens · ${number(usage.cached_hits)} resultados reutilizados.`;
     $('delete-ai-key').disabled = !settings.has_api_key;
     updateAiProviderFields();
   }
@@ -240,6 +267,7 @@
   function showRun(run) {
     state.run = run; state.page = 1; state.filterIds = null; state.filterLabel = '';
     $('report').hidden = false; $('report-empty').hidden = true;
+    renderExecutive(run.analysis?.executive);
     $('report-profile').textContent = '@' + handle(run.profile);
     $('synthesis-heading').textContent = 'Resumen del contenido de @' + handle(run.profile);
     $('report-meta').textContent = run.aggregate ? `${list(run.records).length} evidencias acumuladas · actualizado ${date(run.last_updated_at || run.updated_at || run.created_at, true)}` : `Captura del ${date(run.created_at, true)} · ${list(run.records).length} registros en esta ejecución`;
@@ -624,9 +652,9 @@
       try { const data = new FormData(); data.append('file', input.files[0]); const job = await api(recordEndpoint(record, '/media'), { method: 'POST', body: data }); state.jobProfile = state.run.aggregate ? state.run.profile : null; $('evidence-dialog').close(); startPolling(job); }
       catch (error) { feedback.textContent = error.message; feedback.classList.add('error'); feedback.hidden = false; } finally { upload.disabled = !input.files.length; }
     });
-    const gemini = state.ai?.provider === 'gemini', visionReady = gemini ? Boolean(state.ai?.configured) : Boolean(state.app?.capabilities?.ollama);
-    const vision = el('button', 'button button-small', gemini ? 'Interpretar con Gemini' : 'Interpretar con IA local'); vision.type = 'button'; vision.disabled = !visionReady || !paths.length;
-    vision.title = !paths.length ? 'Se necesita un recorte verificado: vuelve a capturar o adjunta una imagen del contenido' : !visionReady ? 'Configura el proveedor en Ajustes de interpretación con IA' : gemini ? 'Enviar recortes verificados y texto de esta evidencia a Google' : 'Interpretar los recortes usando el modelo local';
+    const gemini = state.ai?.provider === 'gemini', visionReady = gemini && Boolean(state.ai?.configured);
+    const vision = el('button', 'button button-small', gemini ? 'Interpretar con Gemini' : 'Solo OCR · visión desactivada'); vision.type = 'button'; vision.disabled = !visionReady || !paths.length;
+    vision.title = !paths.length ? 'Se necesita un recorte verificado: vuelve a capturar o adjunta una imagen del contenido' : !visionReady ? 'Selecciona Gemini en Ajustes IA si aceptas envío remoto y posible coste' : 'Enviar recortes verificados y texto de esta evidencia a Google';
     vision.addEventListener('click', async () => { vision.disabled = true; try { const job = await api(recordEndpoint(record, '/vision'), { method: 'POST' }); state.jobProfile = state.run.aggregate ? state.run.profile : null; $('evidence-dialog').close(); startPolling(job); } catch (error) { feedback.textContent = error.message; feedback.classList.add('error'); feedback.hidden = false; } finally { vision.disabled = false; } });
     append(media, append(el('div', 'media-actions'), input, upload, vision));
     if (!paths.length) media.append(el('p', '', 'La interpretación necesita un recorte verificado del contenido. Vuelve a capturar o adjunta una imagen; las referencias de diagnóstico se conservan aparte.'));
@@ -644,7 +672,7 @@
     $('cancel-job').disabled = !isActive(job);
     $('capture-button').disabled = isActive(job);
     $('auto-button').disabled = isActive(job);
-    $('session-button').disabled = isActive(job); $('close-session').disabled = isActive(job);
+    $('session-button').disabled = isActive(job); $('close-session').disabled = isActive(job); $('login-button').disabled = isActive(job); $('preflight-button').disabled = isActive(job);
   }
   async function startPolling(initial) {
     const job = initial.job || initial;
@@ -696,19 +724,29 @@
     const sources = [...document.querySelectorAll('input[name="source"]:checked')].map((input) => input.value);
     if (!sources.length) throw new Error('Selecciona al menos una sección para capturar.');
     await saveProfile();
-    const payload = { profile, sources, max_items: Number($('max-items').value), scroll_rounds: Number($('scroll-rounds').value), publish: $('auto-publish').checked };
+    const payload = { ...profilePayload(), publish: false };
     const job = await api('/api/auto', { method: 'POST', body: payload });
     state.jobProfile = handle(profile);
     startPolling(job);
   }));
   $('capture-mode').addEventListener('change', updateCaptureMode);
+  $('capture-depth').addEventListener('change', updateCaptureMode);
+  $('preflight-button').addEventListener('click', () => busy($('preflight-button'), async () => {
+    $('preflight-result').textContent = 'Inspeccionando contenido visible; sin guardar imágenes ni analizar…';
+    try {
+      const result = await api('/api/preflight', { method: 'POST', body: profilePayload() });
+      const sources = Object.entries(result.sources).map(([source, item]) => `${sourceNames[source]}: ${item.observed_minimum === undefined ? item.reason || item.status : 'al menos ' + item.observed_minimum + ' enlaces visibles'}`);
+      const range = result.options.duration_minutes;
+      $('preflight-result').textContent = sources.join(' · ') + `. Estimación ${range[0]}–${range[1]} minutos. ${result.options.duration_basis} ${result.options.coverage}`;
+    } finally { await refreshState({ quiet: true }); }
+  }));
   $('capture-headless').addEventListener('change', updateCaptureMode);
   $('max-items').addEventListener('change', updateCaptureMode);
   $('ai-provider').addEventListener('change', updateAiProviderFields);
   $('ai-settings-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     await busy($('save-ai-settings'), async () => {
-      const body = { provider: $('ai-provider').value, model: $('ai-model').value.trim() || 'gemini-3.8-flash', auto_visual: $('ai-auto-visual').checked, max_per_run: Number($('ai-max-per-run').value) };
+      const body = { provider: $('ai-provider').value, model: $('ai-model').value.trim() || 'gemini-3.5-flash-lite', auto_visual: $('ai-auto-visual').checked, max_per_run: Number($('ai-max-per-run').value) };
       if ($('ai-key').value.trim()) body.api_key = $('ai-key').value.trim();
       try { const response = await api('/api/ai/settings', { method: 'PUT', body }); renderAiSettings(response); toast('Ajustes de interpretación guardados.'); }
       finally { $('ai-key').value = ''; }
@@ -731,8 +769,8 @@
     try { await saveProfile(); const data = new FormData(); data.append('file', file); await api(profileEndpoint($('profile-input').value, '/avatar'), { method: 'POST', body: data }); const config = await api(profileEndpoint($('profile-input').value)); fillProfile(config); await refreshState({ quiet: true }); toast('Foto del perfil guardada.'); }
     catch (error) { notice(error.message, true); } finally { event.target.value = ''; }
   });
-  $('session-button').addEventListener('click', () => busy($('session-button'), async () => { const result = await api('/api/session/open', { method: 'POST', body: { profile: $('profile-input').value.trim() } }); notice(result.message || 'El navegador está abierto. Completa el inicio de sesión manualmente y vuelve aquí para iniciar la captura.'); await refreshState({ quiet: true }); }));
-  $('login-button').addEventListener('click', () => busy($('login-button'), async () => { const result = await api('/api/session/login', { method: 'POST', body: { profile: $('profile-input').value.trim() } }); notice(result.message || 'Iniciá sesión en la ventana normal de Chrome, cerrala y después generá el informe.'); await refreshState({ quiet: true }); }));
+  $('session-button').addEventListener('click', () => busy($('session-button'), async () => { const result = await api('/api/session/open', { method: 'POST', body: { profile: $('profile-input').value.trim(), session_mode: $('session-mode').value } }); notice(result.status || 'Navegador abierto.'); await refreshState({ quiet: true }); }));
+  $('login-button').addEventListener('click', () => busy($('login-button'), async () => { $('session-mode').value = 'logged_in'; const result = await api('/api/session/login', { method: 'POST', body: { profile: $('profile-input').value.trim(), session_mode: 'logged_in' } }); notice(result.message || 'Inicia sesión manualmente, cierra esa ventana y vuelve a capturar.'); await refreshState({ quiet: true }); }));
   $('close-session').addEventListener('click', () => busy($('close-session'), async () => { await api('/api/session/close', { method: 'POST' }); await refreshState(); toast('Navegador cerrado. La sesión guardada permanece en tu equipo.'); }));
   $('refresh-state').addEventListener('click', () => busy($('refresh-state'), async () => { await refreshState(); }));
   $('cancel-job').addEventListener('click', () => busy($('cancel-job'), async () => { if (state.job?.id) { await api('/api/jobs/' + encodeURIComponent(state.job.id) + '/cancel', { method: 'POST' }); $('job-message').textContent = 'Cancelación solicitada. Esperando al proceso actual…'; } }));
@@ -762,4 +800,258 @@
     }
   }
   initialize();
+})();
+
+// Supported URL -> scope/depth -> analyze -> executive report workflow.
+(() => {
+  'use strict';
+  const $ = (id) => document.getElementById('guided-' + id);
+  const names = {uploads: 'Publicaciones', reposts: 'Compartidos', likes: 'Me gusta'};
+  const depthLimits = {quick: [5, 3], deep: [60, 25], all: [200, 50]};
+  const active = (job) => job && ['pending', 'running'].includes(job.status);
+  let job = null;
+  let polling = false;
+  let currentRun = null;
+  const rows = (value) => Array.isArray(value) ? value : [];
+  const node = (tag, text, className = '') => {
+    const result = document.createElement(tag);
+    result.textContent = String(text ?? '');
+    result.className = className;
+    return result;
+  };
+  function message(text, error = false) {
+    $('notice').hidden = !text;
+    $('notice').textContent = text;
+    $('notice').classList.toggle('error', error);
+  }
+  async function api(path, method = 'GET', body) {
+    const response = await fetch(path, {method, ...(body ? {headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)} : {})});
+    let result;
+    try { result = await response.json(); }
+    catch { throw new Error(`El servidor no devolvió una respuesta válida (HTTP ${response.status}).`); }
+    if (!response.ok) {
+      const detail = result.detail;
+      throw new Error(typeof detail === 'string' ? detail : detail?.message || rows(detail).map((entry) => entry.msg).join('; ') || 'Solicitud no disponible.');
+    }
+    return result;
+  }
+  function options() {
+    const sources = [...document.querySelectorAll('input[name="guided-source"]:checked')].map((input) => input.value);
+    if (!sources.length) throw new Error('Selecciona al menos una fuente.');
+    if ($('date').value === 'last30days' && (sources.length !== 1 || sources[0] !== 'uploads')) throw new Error('Últimos 30 días solo admite publicaciones propias.');
+    const depth = $('depth').value;
+    const [items, rounds] = depthLimits[depth] || [Number($('items').value), Number($('scrolls').value)];
+    if (!Number.isInteger(items) || items < 1 || items > 200 || !Number.isInteger(rounds) || rounds < 1 || rounds > 50) {
+      throw new Error('Personalizada requiere 1–200 elementos y 1–50 rondas, ambos enteros.');
+    }
+    return {profile: $('url').value.trim(), sources, depth,
+      max_items: items, scroll_rounds: rounds,
+      date_filter: $('date').value, mode: $('mode').value, session_mode: 'logged_in',
+      headless: false, wait_captcha: false, visual_limit: Number($('ai-limit').value)};
+  }
+  function estimate() {
+    const preset = depthLimits[$('depth').value];
+    const [items, rounds] = preset || [Number($('items').value), Number($('scrolls').value)];
+    const sources = document.querySelectorAll('input[name="guided-source"]:checked').length;
+    $('custom').hidden = Boolean(preset);
+    ['items', 'scrolls'].forEach((id) => {
+      $(id).disabled = Boolean(preset);
+      $(id).required = !preset;
+    });
+    if (!preset && (!Number.isInteger(items) || items < 1 || items > 200 || !Number.isInteger(rounds) || rounds < 1 || rounds > 50)) {
+      $('estimate').textContent = 'Introduce límites personalizados válidos: 1–200 elementos y 1–50 rondas. No se ajustan automáticamente.';
+      return;
+    }
+    const low = Math.max(1, Math.round(sources * items * 8 / 60));
+    const high = Math.max(2, Math.round(sources * items * 45 / 60 + rounds));
+    $('estimate').textContent = `Hasta ${items} trabajos y ${rounds} rondas por fuente. Duración orientativa: ${low}–${high} min, sin esperas manuales. Inspección visible automática; mínimos observados, nunca totales históricos.`;
+  }
+  function access(reason) {
+    $('access').hidden = !reason;
+    $('access-reason').textContent = reason || '';
+  }
+  function evidenceLink(url, label) {
+    try {
+      const parsed = new URL(url);
+      if (parsed.protocol !== 'https:' || !['www.tiktok.com', 'tiktok.com'].includes(parsed.hostname)) return node('span', label);
+      const link = node('a', label, 'text-button');
+      link.href = parsed.href; link.target = '_blank'; link.rel = 'noopener noreferrer';
+      return link;
+    } catch { return node('span', label); }
+  }
+  function render(run) {
+    if (run.is_demo || run.collection?.method === 'synthetic_demo' || run.profile === 'demo_ficticia') throw new Error('Los datos ficticios no se abren como informes reales.');
+    currentRun = run;
+    const report = run.analysis?.executive;
+    $('report').hidden = false;
+    $('report-heading').textContent = 'Informe ejecutivo · @' + run.profile;
+    const outcome = effectiveStatus(run);
+    $('report-meta').textContent = `${run.records?.length || 0} evidencias observadas · estado: ${outcome} · ${run.created_at || ''}`;
+    const base = '/api/runs/' + encodeURIComponent(run.id) + '/export?format=';
+    $('export-md').href = base + 'md'; $('export-json').href = base + 'json';
+    const target = $('executive'); target.replaceChildren();
+    if (outcome !== 'completed') target.append(node('p', outcome === 'observed_empty'
+      ? 'Sin evidencia en el recorrido observado. No se afirma ausencia de actividad ni historial vacío.'
+      : 'Informe parcial o no disponible: este intento no produjo una muestra completa. Las fuentes bloqueadas o no evaluadas no se interpretan como vacías.', 'notice'));
+    const blockers = [...rows(run.collection?.blockers), ...rows(run.collection?.issues)];
+    const reasons = [...new Set([run.collection?.last_capture_reason, ...blockers.map((issue) => issue.message || issue.reason || issue.code)].filter(Boolean))];
+    reasons.forEach((reason) => target.append(node('p', reason, 'notice')));
+    target.append(node('p', report?.summary || 'No hay evidencia suficiente para un resumen de contenido.', 'summary-text'));
+    const coverage = node('ul', '', 'thematic-profile');
+    const coverageRows = rows(report?.coverage).slice();
+    const requested = rows(run.collection?.requested_sources).length ? run.collection.requested_sources : rows(run.collection?.options?.sources);
+    requested.forEach((source) => {
+      if (coverageRows.some((item) => item.source === source)) return;
+      const detail = run.collection?.sources?.[source] || {};
+      coverageRows.push({source, observed: rows(run.records).filter((record) => record.source === source).length,
+        analyzed: 0, visual_analyzed: 0, unknown_publication_dates: 0, excluded_by_date: 0, unknown_date_filter: 0,
+        status: detail.status || 'unassessed', reason: detail.reason || 'Disponibilidad no evaluada; no se afirma ausencia de contenido.'});
+    });
+    coverageRows.forEach((item) => coverage.append(node('li', `${names[item.source] || item.source}: ${item.observed} recopilados · ${item.analyzed} con texto analizable · ${item.visual_analyzed} con visión · ${item.status}. ${item.reason || ''} ${item.unknown_publication_dates} sin fecha original; ${item.excluded_by_date} excluidos y ${item.unknown_date_filter} sin fecha para el filtro. Total histórico desconocido.`)));
+    target.append(coverage);
+    rows(report?.themes).forEach((theme) => {
+      const line = node('p', `${theme.name} (${theme.count}): `, 'summary-text');
+      rows(theme.evidence).forEach((item) => { line.append(evidenceLink(item.url, item.id + ' ↗'), document.createTextNode(' ')); });
+      target.append(line);
+    });
+    target.append(node('p', report?.date_provenance || 'Las fechas de publicación y las acciones se conservan por separado.', 'muted'));
+    const limits = node('details', '', 'guided-details');
+    limits.append(node('summary', 'Limitaciones y próximos pasos'));
+    const list = node('ul', '', 'thematic-profile');
+    [...rows(report?.limitations), ...rows(report?.next_steps)].forEach((text) => list.append(node('li', text)));
+    limits.append(list); target.append(limits);
+    const details = $('evidence'); details.replaceChildren();
+    reasons.forEach((reason) => details.append(node('p', reason, 'muted')));
+    Object.entries(run.collection?.sources || {}).forEach(([source, info]) => {
+      if (info.method === 'tiktok_web_response') {
+        details.append(node('p', `${names[source] || source}: datos de TikTok y portadas · ${info.pages_observed || 0} páginas observadas.`, 'muted'));
+      } else if (info.structured_fallback) {
+        details.append(node('p', `${names[source] || source}: se utilizó la captura visual porque no se obtuvo una respuesta de datos válida.`, 'muted'));
+      }
+    });
+    const tabs = rows(run.collection?.detected_tabs || run.collection?.preview?.detected_tabs);
+    if (tabs.length) details.append(node('p', 'Pestañas observadas: ' + tabs.map((tab) => tab.label || tab.selector).join(' · '), 'muted'));
+    rows(run.records).forEach((record) => {
+      const entry = node('details', '', 'guided-record');
+      entry.append(node('summary', `${names[record.source] || record.source}: ${record.caption || record.id}`));
+      entry.append(evidenceLink(record.url, 'Evidencia original ↗'));
+      entry.append(node('p', `Fecha original: ${record.published_at || 'desconocida'} · fecha de acción: ${record.interaction_at || 'desconocida'} · filtro: ${record.date_filter_status || 'included'}`, 'muted'));
+      entry.append(node('p', record.visual_summary || '', 'summary-text'));
+      // Only guarded frames may be displayed, never legacy or diagnostic images.
+      rows(record.frames).filter((path) => {
+        const info = record.frame_quality?.[path];
+        return info?.status === 'verified' && (info.source === 'user_upload' || info.overlay_guard_version === 1 || (info.source === 'tiktok_cdn' && info.validation_version === 1));
+      }).slice(0, 7).forEach((path) => {
+        if (typeof path !== 'string' || !path.startsWith('artifacts/') || path.split('/').includes('..')) return;
+        const image = document.createElement('img');
+        image.src = '/data/' + path.split('/').map(encodeURIComponent).join('/');
+        image.alt = 'Recorte verificado de la evidencia'; image.loading = 'lazy';
+        entry.append(image);
+      });
+      details.append(entry);
+    });
+  }
+  function effectiveStatus(run) {
+    if (run.status !== 'completed' || rows(run.records).length) return run.status;
+    const requested = rows(run.collection?.requested_sources).length ? run.collection.requested_sources : rows(run.collection?.options?.sources);
+    return requested.length && requested.every((source) => run.collection?.sources?.[source]?.status === 'observed_empty') ? 'observed_empty' : 'unavailable';
+  }
+  function outcomeTitle(status) {
+    return {completed: 'Análisis terminado', observed_empty: 'Sin evidencia en este recorrido',
+      unavailable: 'Evidencia no disponible', partial: 'Análisis parcial', cancelled: 'Análisis detenido',
+      needs_attention: 'Análisis bloqueado · requiere atención', failed: 'Análisis fallido'}[status] || 'Análisis detenido / parcial';
+  }
+  async function refresh() {
+    const state = await api('/api/state');
+    $('connection').textContent = 'Servidor local conectado';
+    $('browser').textContent = state.browser?.open ? state.browser.status : 'Chrome de Windows · HuellaBrowser · se conectará automáticamente al analizar.';
+    const history = $('history'); history.replaceChildren();
+    rows(state.runs).filter((run) => !run.is_demo && run.profile !== 'demo_ficticia').slice(0, 30).forEach((run) => {
+      const status = run.status === 'completed' && !run.count ? 'unavailable' : run.status;
+      const button = node('button', `@${run.profile} · ${run.count} evidencias · ${status} · ${run.created_at}`, 'run-item');
+      button.type = 'button';
+      button.addEventListener('click', async () => {
+        try { render(await api('/api/runs/' + encodeURIComponent(run.id))); } catch (error) { message(error.message, true); }
+      }); history.append(button);
+    });
+    // Never select historical or synthetic reports automatically.
+    if (!job && !polling) {
+      const running = rows(state.jobs).find(active);
+      if (running) poll(running);
+    }
+    return state;
+  }
+  async function poll(initial) {
+    if (polling) return;
+    polling = true; job = initial;
+    $('analyze').disabled = true; $('progress').hidden = false; $('open').disabled = true;
+    try {
+      while (true) {
+        job = await api('/api/jobs/' + encodeURIComponent(initial.id));
+        $('job-title').textContent = active(job) ? 'Analizando…' : 'Comprobando el resultado…';
+        $('job-message').textContent = job.message || '';
+        $('job-progress').value = job.progress || 0;
+        if (job.preview) {
+          const counts = Object.entries(job.preview.sources || {}).map(([source, info]) => `${names[source]}: ${info.observed_minimum ?? info.status ?? 'no disponible'}`).join(' · ');
+          $('job-message').textContent += ' Mínimos visibles: ' + counts;
+        }
+        if (!active(job)) break;
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+      }
+      if (job.run_id) render(await api('/api/runs/' + encodeURIComponent(job.run_id)));
+      const outcome = job.run_id ? effectiveStatus(currentRun) : job.status;
+      $('job-title').textContent = outcomeTitle(outcome);
+      if (job.status === 'needs_attention' || job.status === 'failed') access(job.message || 'Revisa el navegador dedicado y vuelve a analizar.');
+      message(outcome !== 'completed' ? currentRun?.collection?.last_capture_reason || 'Este intento no es un análisis exitoso; revisa los estados de cobertura y los bloqueos.' : job.message, outcome !== 'completed');
+    } catch (error) { message(error.message, true); }
+    finally {
+      polling = false; job = null; $('analyze').disabled = false; $('open').disabled = false;
+      $('cancel').hidden = true;
+      try { await refresh(); } catch { $('connection').textContent = 'Servidor local no disponible'; }
+    }
+  }
+  $('form').addEventListener('submit', async (event) => {
+    event.preventDefault(); if (polling) return;
+    $('analyze').disabled = true;
+    try {
+      const body = options();
+      message(''); access(''); $('report').hidden = true; currentRun = null; $('cancel').hidden = false;
+      await poll(await api('/api/auto', 'POST', body));
+    } catch (error) { message(error.message, true); }
+    finally { $('analyze').disabled = false; }
+  });
+  $('open').addEventListener('click', async () => {
+    if (polling || active(job)) return;
+    $('open').disabled = true;
+    message('Conectando con el navegador dedicado de Windows…');
+    try {
+      const result = await api('/api/session/login', 'POST', {profile: currentRun?.profile || $('url').value.trim(), session_mode: 'logged_in'});
+      message(result.message); await refresh();
+    } catch (error) { message(error.message, true); access(error.message); }
+    finally { $('open').disabled = false; }
+  });
+  $('cancel').addEventListener('click', async () => {
+    if (!job) return;
+    try { await api('/api/jobs/' + encodeURIComponent(job.id) + '/cancel', 'POST'); message('Detención solicitada; se conserva la evidencia obtenida.'); }
+    catch (error) { message(error.message, true); }
+  });
+  $('ai-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    try {
+      const body = {provider: $('provider').value, model: $('model').value, auto_visual: $('ai-auto').checked, max_per_run: Number($('ai-limit').value)};
+      if ($('key').value) body.api_key = $('key').value;
+      const result = await api('/api/ai/settings', 'PUT', body);
+      $('key').value = '';
+      $('ai-status').textContent = `Ajustes guardados · modelo efectivo: ${result.model} · ${result.has_api_key ? 'clave disponible, no mostrada' : 'sin clave'}.`;
+    } catch (error) { message(error.message, true); }
+  });
+  ['depth', 'items', 'scrolls'].forEach((id) => $(id).addEventListener('change', estimate));
+  document.querySelectorAll('input[name="guided-source"]').forEach((input) => input.addEventListener('change', estimate));
+  estimate();
+  refresh().then((state) => {
+    const ai = state.ai || {};
+    $('provider').value = ai.provider || 'disabled'; $('model').value = ai.model || 'gemini-3.5-flash-lite';
+    $('ai-auto').checked = ai.auto_visual === true; $('ai-limit').value = ai.max_per_run || 1;
+    $('ai-status').textContent = ai.has_api_key ? 'Clave disponible desde configuración; no se muestra.' : 'Sin clave: OCR local disponible.';
+  }).catch((error) => { $('connection').textContent = 'Servidor local no disponible'; message(error.message, true); });
 })();

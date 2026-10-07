@@ -78,15 +78,10 @@ def _ollama_model() -> str:
 
 def capabilities() -> dict[str, bool]:
     """Report optional dependencies/configuration without initializing models."""
-    try:
-        ollama = bool(_ollama_model()) and bool(_ollama_base_url())
-    except ValueError:
-        ollama = False
     return {
         "ocr": _available("rapidocr_onnxruntime"),
         "opencv": _available("cv2"),
         "whisper": _available("faster_whisper") and bool(os.getenv("WHISPER_MODEL", "").strip()),
-        "ollama": ollama,
     }
 
 
@@ -513,6 +508,7 @@ No inventes fechas ni autorías. Devuelve un resumen breve de máximo 180 palabr
 
 
 def describe_frames(frame_paths: list[Path], context: str = "") -> dict[str, Any]:
+    # Legacy helper only: no supported API/UI/provider calls this function.
     """Summarize scenes through a configured local vision model, if available."""
     result: dict[str, Any] = {"visual_summary": "", "notes": []}
     notes = result["notes"]

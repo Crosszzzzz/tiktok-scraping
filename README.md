@@ -4,52 +4,102 @@ Aplicación local para reunir evidencias visibles de TikTok y comparar sus temas
 
 El informe describe **contenido observado**. Una frase de despedida, una canción o un repost no prueban una ruptura, un estado emocional ni una vivencia del titular. El proyecto no construye diagnósticos, perfiles psicológicos ni inferencias de atributos privados.
 
-## Inicio en Windows
+## Inicio en WSL2
 
-Requisitos: **Python 3.12**, Google Chrome instalado y acceso a Internet para visitar TikTok. El backend es FastAPI; la interfaz usa HTML, CSS y JavaScript sin compilación de frontend.
+Ejecuta la aplicación en WSL2 con Python 3.12. Instala Chrome en **Windows**, no en Linux. Desde la raíz del proyecto, con el entorno local ya preparado:
 
-Desde PowerShell, en la carpeta del proyecto:
-
-```powershell
-.\start.ps1
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+sh start.sh
 ```
 
-El script crea `.venv` e instala `requirements.txt` si el entorno aún no existe. Después abre [Huella](http://127.0.0.1:8765) en el navegador. El servidor escucha en `127.0.0.1:8765`; `Ctrl+C` lo detiene.
+`start.sh` usa la raíz del proyecto, no el directorio desde el que lo invocas.
+No instala paquetes automáticamente y el servidor permanece en loopback.
 
-Si prefieres preparar el entorno manualmente:
+### Configuración local sin guardar la clave en la interfaz
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m app
-```
+El inicio mediante `python -m app` carga el archivo `.env` de la raíz antes
+de importar los consumidores de configuración. Una variable ya presente en el
+proceso tiene prioridad. Importar módulos en pruebas no carga ese archivo.
+Puedes crear `.env` localmente con `GEMINI_API_KEY`, `GEMINI_MODEL=gemini-3.5-flash-lite` y `HUELLA_PORT` (8765 por
+defecto); nunca compartas ese archivo ni su contenido. Se aceptan asignaciones
+simples, valores entre comillas y comentarios; no se expanden variables ni se
+ejecutan comandos. Los lanzadores usan `python -m app`. La alternativa
+`uvicorn app.main:app` no lee `.env`: exporta previamente las variables necesarias
+en el proceso y configura su puerto mediante `--port`.
+La clave del entorno no se elimina desde el panel y en Linux puede permanecer
+exclusivamente en ese entorno. Esto no valida disponibilidad, cuota ni precio.
 
-Con [uv](https://docs.astral.sh/uv/pip/environments/) ya instalado:
+### Chrome de Windows, una sola sesión dedicada
 
-```powershell
-uv venv --python 3.12 .venv
-uv pip install --python .\.venv\Scripts\python.exe -r requirements.txt
-.\.venv\Scripts\python.exe -m app
-```
+Abre la URL indicada por el servidor, normalmente `http://127.0.0.1:8765`. `Ctrl+C` detiene la aplicación. No hay aplicación ni lanzador independiente para Windows/macOS/Linux nativo; el archivo PowerShell del puente sirve exclusivamente a WSL.
 
-No necesitas activar el entorno. Si `.venv` ya existe pero faltan paquetes, ejecuta otra vez el comando de instalación correspondiente. Un entorno creado por uv puede no incluir pip; en ese caso usa `uv pip install`.
+El puente descubre Chrome en los directorios de instalación de Windows mediante `powershell.exe`. Crea el perfil dedicado `%LOCALAPPDATA%\HuellaBrowser\`; no usa tu perfil habitual ni copia cookies. Puedes intentar contenido público sin iniciar sesión. Si TikTok exige acceso, lo completas una vez en esa ventana; Chrome conserva la sesión para futuras ejecuciones mientras siga siendo válida.
 
-`requirements.lock.txt` conserva las versiones del entorno validado. Para preparar un entorno con esas versiones, sustituye `requirements.txt` por `requirements.lock.txt` en el comando de instalación. El lock usa una sola variante de OpenCV: `opencv-python`.
+Chrome abre CDP en loopback de Windows con puerto asignado por el sistema. El puente verifica PID, inicio del proceso y la identidad websocket contra metadatos propios del perfil antes de reutilizarlo. Un bloqueo de propiedad detiene la conexión: nunca se adjunta un puerto ajeno. El websocket viaja por stdin/stdout de PowerShell a un socket WSL `127.0.0.1` de una sola conexión. El diseño no expone CDP a LAN/NAT ni modifica firewall o políticas; la consulta de propiedad en Windows desactiva proxies del entorno.
 
-Se utiliza el canal `chrome` de Playwright, que abre Chrome instalado. Instalar solamente el Chromium de Playwright no sustituye ese requisito. Consulta la [documentación de navegadores de Playwright](https://playwright.dev/python/docs/browsers#google-chrome--microsoft-edge).
+Windows puede rechazar la ejecución directa de un `.ps1` desde la ruta UNC de WSL con un error de AuthorizationManager. La aplicación copia únicamente su helper a `%LOCALAPPDATA%\HuellaBrowser\huella-cdp-bridge.ps1` y lo ejecuta desde ese directorio local autorizado, sin cambiar la política de ejecución. Si Windows también bloquea el helper local, se informa el bloqueo y no se intenta evadirlo.
+
+Playwright usa `connect_over_cdp` y `browser.contexts[0]`, el contexto persistente existente, no un contexto incógnito nuevo. Al detener el servidor se desconecta el transporte; no se cierra el navegador ni otras pestañas. **No cierres Chrome antes de capturar.** CDP tiene menor fidelidad que un navegador lanzado directamente por Playwright; la validación real sigue siendo necesaria.
+
+PowerShell se busca primero en PATH y después únicamente en su directorio estándar de los discos Windows montados, respetando mayúsculas como `WINDOWS`. `wslpath` se descubre por separado, con respaldo en `/usr/bin/wslpath`. Si falta una herramienta o WSL deniega ejecutar Windows, la interfaz conserva el motivo del HTTP 409; no simula una conexión ni abre Chrome de Linux. No se instalan paquetes ni cambian políticas del equipo automáticamente. `requirements.lock.txt` conserva versiones; úsalo en lugar de `requirements.txt` si necesitas reproducir el entorno.
+
+Después de actualizar, detén el servidor con `Ctrl+C` y reinicia desde la raíz con `sh start.sh`; recarga el panel. No hace falta modificar PATH permanentemente. Para una instalación no estándar, puedes indicar una ruta WSL absoluta existente a `powershell.exe` solo para ese inicio: `HUELLA_POWERSHELL_EXE=/mnt/c/WINDOWS/System32/WindowsPowerShell/v1.0/powershell.exe sh start.sh`. Una ruta inválida se rechaza sin respaldo silencioso. Si el ejecutable existe pero WSL no puede ejecutarlo, reiniciar la aplicación no repara la interoperabilidad: solicita al administrador revisar la integración WSL/Windows, sin cambiar políticas desde Huella.
 
 ## Primera captura
 
 1. Inicia el servidor y abre el panel local.
-2. Introduce el usuario, `@usuario` o el enlace real del perfil. Abre la sesión de Chrome desde el panel.
-3. Completa **manualmente** el inicio de sesión en la ventana que se abre. El proyecto no solicita tu contraseña en su interfaz.
-4. Selecciona publicaciones, compartidos y/o Me gusta. Comienza con una muestra pequeña para revisar la cobertura y los selectores.
-5. Guarda el perfil e inicia la captura. «Capturar sin ventana» está activado por defecto. Revisa el estado de cada fuente y las notas de cada evidencia antes de interpretar el informe.
-6. Corrige textos o fechas que puedas verificar, adjunta archivos locales si necesitas más contexto y vuelve a analizar. Puedes exportar JSON o Markdown.
+2. Introduce la URL, `@usuario` o el nombre del perfil.
+3. Selecciona alcance y profundidad; pulsa **Analizar**. Chrome se conecta automáticamente y obtiene las respuestas de datos de cada fuente y sus portadas, con los límites elegidos. Si esa respuesta no está disponible, intenta la captura visual existente. No necesitas guardar perfiles ni ejecutar una vista previa aparte.
+4. Revisa progreso y después el informe ejecutivo; exporta Markdown o JSON. Evidencias, historial, fechas y ajustes de API están plegados. El historial no se abre automáticamente; los datos ficticios no se seleccionan como informes reales.
+5. Si se detiene por acceso, CAPTCHA o introducción, usa **Abrir navegador / resolver acceso**. Resuélvelo tú en HuellaBrowser y pulsa **Analizar** otra vez, sin cerrar Chrome. No hay espera automática prolongada ni resolución del desafío.
 
-La sesión usa un **perfil de Chrome dedicado y persistente**, guardado en `.browser-profile/`. La API no se conecta a tus pestañas actuales ni reutiliza automáticamente la sesión de tu Chrome habitual. Tras iniciar sesión una vez, Chrome puede conservarla en ese perfil; TikTok puede volver a pedir autenticación.
+La navegación siempre usa la misma sesión dedicada y visible, autenticada o no. Una sesión anónima aquí significa no haber iniciado sesión, no crear otra ventana/incógnito en cada trabajo. No hay demos, importación ni publicación pública en el flujo soportado.
 
-Una verificación, un límite de acceso o un perfil privado detienen la captura para revisión. Una pestaña ausente, privada o que no carga se registra como tal: no significa que el usuario nunca publicara, compartiera o marcara Me gusta. El colector no evade estas restricciones.
+Una verificación, un límite de acceso o un perfil realmente restringido detienen la captura para revisión. Un aviso de cuenta privada no bloquea tarjetas que ya sean visibles y accesibles; no se intenta obtener lo oculto. Una pestaña ausente, privada o que no carga no demuestra ausencia de actividad.
+
+| Profundidad | Trabajos por fuente | Desplazamientos por fuente |
+| --- | ---: | ---: |
+| Rápida | 5 | 3 |
+| Personalizada | 1–200 | 1–50 |
+| Profunda | 60 | 25 |
+| Todo accesible | 200 | 50 |
+
+«Todo accesible» sigue siendo acotado. Guarda lo observado y permite continuar con otra captura incremental; no garantiza recorrer todo el historial. Se conservan límites y preferencias por perfil. No se reanuda un trabajo activo después de reiniciar el servidor.
+
+**Últimos 30 días** usa la fecha original visible o verificada de publicaciones propias, hasta hoy. La API rechaza ese filtro para compartidos y Me gusta, porque no conoce la fecha de acción. Las observaciones con fecha desconocida se conservan con `date_filter_status=unknown_date`, pero no pasan al OCR, Gemini ni al análisis filtrado; tampoco se adivina su fecha. El archivo acumulado puede contener capturas anteriores: revisa el informe individual para el alcance exacto de la ejecución.
+
+
+## Recolección estructurada y portadas
+
+El flujo Analizar intenta primero leer las respuestas que TikTok entrega a la sesión
+HuellaBrowser para publicaciones, reposts y Me gusta. La arquitectura toma como
+referencia [Repostify](https://github.com/xtofuub/Repostify), con una implementación
+Python propia en `app/tiktok_feed.py`; no requiere instalar Repostify, otra API ni
+entregar cookies a terceros. Se reutiliza Playwright, que ya es una dependencia.
+
+Cada fuente se abre desde el perfil y se valida su `secUid`, endpoint y continuidad
+de cursores. TikTok realiza su propia paginación al desplazarse; no se inventan
+firmas ni se reutilizan peticiones de otros perfiles. Los límites de desplazamientos
+y trabajos siguen vigentes. Si faltan la identidad o las respuestas iniciales, se
+usa el colector visual como respaldo. Un CAPTCHA sigue requiriendo atención manual.
+
+Cada registro conserva enlace, autor original, descripción, fecha de publicación,
+métricas y portada disponible. Las portadas se descargan desde dominios CDN admitidos,
+con límites de tamaño, sin reenviar cookies ni seguir redirecciones. Se decodifican y
+guardan localmente como JPEG; OCR y Gemini pueden usarlas. Una portada no equivale a
+una captura completa del video: el flujo estructurado no obtiene todas sus escenas,
+audio ni todas las diapositivas. Los videos/archivos adjuntos mantienen su procesamiento
+existente. Las capturas de detalle siguen disponibles en el respaldo visual.
+
+La interfaz identifica las fuentes obtenidas mediante datos estructurados y las que
+usaron el respaldo visual.
+
+El informe registra `method=tiktok_web_response` por fuente, páginas observadas y
+motivo de parada. Si falla una portada se conserva el enlace y se marca procesamiento
+parcial para reintentar. Una respuesta bloqueada o inválida nunca significa perfil
+vacío. `createTime` no se convierte en fecha de repost o Me gusta.
 
 ## Perfiles guardados y actualizaciones
 
@@ -61,27 +111,29 @@ Se conservan la primera y última observación, las correcciones manuales y la p
 
 El archivo acumulado reúne contenido de todas las capturas. Los informes individuales permiten revisar cada ejecución y sus bloqueos. La fecha de primera observación sigue sin ser una fecha de repost. Las menciones conservan su texto, fuente y autoría cuando se puede verificar; una etiqueta no establece una relación entre personas.
 
-La sesión visible se reserva para el acceso manual o una verificación. La captura headless usa el mismo perfil dedicado, pero la plataforma puede presentar resultados distintos según sesión, carga o modo de navegador. El diagnóstico conserva qué pestañas se detectaron y qué impidió continuar. La ayuda de navegación «Entendido» se cierra antes de capturar; un CAPTCHA requiere resolución manual.
+La captura y el acceso manual usan la misma ventana visible. No hay cambio a headless. El diagnóstico conserva qué pestañas se detectaron y qué impidió continuar. La ayuda de navegación «Entendido» se cierra antes de capturar; un CAPTCHA detiene el trabajo sin guardar imágenes del desafío.
 
 ## Interpretar imágenes con Gemini
 
-En **Ajustes IA**, selecciona Gemini, introduce la API key en el campo de contraseña y guarda. La clave no se devuelve a la interfaz ni se incluye en informes. En Windows se cifra con DPAPI para el usuario actual; si no puede cifrarse, se conserva únicamente durante la sesión del servidor. También puedes configurar `GEMINI_API_KEY` en el entorno. Borrar una clave desde el panel no elimina una variable de entorno del proceso.
+En los ajustes plegados de API, selecciona Gemini y autoriza el envío remoto. Configura `GEMINI_API_KEY` mediante el inicio seguro o introduce la clave opcional en el campo de contraseña. En WSL una clave introducida en el panel permanece en memoria del servidor, no se cifra con DPAPI ni se guarda en texto plano. La clave no se devuelve a la interfaz ni se incluye en informes.
 
-El botón de visión de una evidencia analiza sus imágenes recortadas junto con descripción, OCR, etiqueta musical y transcripción disponible. Activar análisis visual automático permite ejecutarlo durante las capturas, con un límite por ejecución (10 por defecto). **Este proveedor envía esas imágenes y textos a Google**. No envía la sesión ni las cookies de TikTok. Ollama permanece como alternativa local.
+La interpretación durante Analizar usa recortes verificados junto con descripción, OCR, etiqueta musical y transcripción disponible. Tiene un límite por ejecución y está desactivada inicialmente. **Gemini envía esas imágenes y textos a Google**, no la sesión ni las cookies. La alternativa soportada es **Solo OCR local**. Ollama ya no está soportado; quedan helpers internos heredados sin ruta en este flujo.
+
+Modelo predeterminado: `gemini-3.5-flash-lite`, orientado a coste reducido. Puedes elegir otro modelo, por ejemplo `gemini-3.5-flash`, `gemini-2.5-flash-lite` o `gemini-3.8-flash`. `GEMINI_MODEL` tiene prioridad sobre el selector mientras esté configurado en el entorno. Solo se hace un intento con el modelo elegido: no hay sustitución automática por uno más caro ni recorrido de modelos al agotar cuota. Disponibilidad, nivel gratuito y compatibilidad con créditos dependen de tu cuenta/proyecto; no se garantizan.
 
 Gemini puede interpretar escenas y prendas aunque no contengan texto. El resultado separa observaciones, posibles referencias culturales, texto visible e incertidumbres. Una prenda puede guardar relación con un estilo regional; eso no acredita la etnia, procedencia o identidad de quien la lleva. La etiqueta de una canción aporta contexto, pero no equivale a haber escuchado su audio.
 
 Se redimensionan y deduplican hasta cuatro imágenes por solicitud. Una caché por contenido, contexto y modelo evita repetir peticiones idénticas. Se registran solicitudes y tokens informados por el proveedor; no se inventa un coste en dólares. La disponibilidad y cuota dependen de tu cuenta. Consulta [visión con Gemini](https://ai.google.dev/gemini-api/docs/image-understanding) y [precios y uso de datos](https://ai.google.dev/gemini-api/docs/pricing); el nivel gratuito puede utilizar el contenido para mejorar productos.
 
-Sin una clave o un modelo local configurado, el OCR sigue funcionando y el resumen indica que falta interpretación visual. Los errores de cuota o autenticación se muestran como bloqueos de IA y conservan la evidencia original.
+Sin Gemini activado y una clave, el OCR sigue funcionando. Los errores de cuota o autenticación detienen los intentos visuales automáticos y conservan la evidencia original.
 
 ## Qué recoge y qué puede faltar
 
 | Evidencia | Implementación actual | Límite que hay que revisar |
 | --- | --- | --- |
-| Publicaciones, compartidos y Me gusta | Rejillas visibles, enlaces y fuente separados | Muestra acotada; una pestaña puede no estar disponible |
+| Publicaciones, compartidos y Me gusta | Respuestas de datos de TikTok y portadas; respaldo con rejillas visibles | Muestra acotada; una pestaña puede no estar disponible |
 | Texto de publicación | Descripción visible o texto alternativo de miniatura | Puede truncarse o faltar según la página |
-| Contexto visual del video | Hasta 3 capturas renderizadas por publicación desde el navegador | No equivale a conservar el video completo; escenas o texto fugaz pueden faltar |
+| Contexto visual del video | Hasta 7 capturas renderizadas, incluido inicio y final, con offsets y deduplicación exacta | No exporta video completo; escenas o texto fugaz pueden faltar |
 | Imágenes y carruseles | Imagen visible o tarjeta recortada cuando puede aislarse sin obstáculos | No garantiza todas las diapositivas. Puedes adjuntar imágenes adicionales |
 | Texto sobreimpreso | OCR local del original y variantes con contraste/recorte | Errores con tipografías, movimiento, idiomas, ironía o bajo contraste |
 | Música | Etiqueta/enlace musical visible, con procedencia | No es reconocimiento de audio; no acredita la letra ni el significado personal |
@@ -90,11 +142,11 @@ Sin una clave o un modelo local configurado, el OCR sigue funcionando y el resum
 | Contadores | Me gusta, comentarios, compartidos y guardados visibles, con hora de observación | Valores abreviados y cambiantes; no son contadores históricos |
 | Cobertura | Estado por fuente, cantidad, límites y notas de extracción | No conocemos el total histórico ni lo eliminado u oculto |
 
-Las capturas completas de página pueden mostrar elementos alrededor de la publicación y se conservan solo como referencia: no se envían automáticamente al OCR ni a visión. El texto se extrae de tarjetas recortadas o fotogramas. El extractor de descripción se limita al reproductor visible y evita incorporar recomendaciones como si fueran afirmaciones del titular. Revisa también el contexto de la imagen: una cita, un meme o un diálogo de película no son una declaración autobiográfica.
+Toda captura, incluso de rejilla y diagnóstico, comprueba obstáculos después de preparar la página y justo antes de guardar. Solo se cierran controles conocidos, como «Entendido» o rechazo de cookies; jamás se oculta una superposición mediante CSS. Un CAPTCHA requiere resolución manual y no se captura; una introducción persistente como «avanza con el mouse para continuar» detiene el intento antes de cualquier imagen. Los diagnósticos nuevos no van a OCR ni a Gemini. Los recortes anteriores sin la nueva marca de seguridad no se reutilizan para visión y requieren recaptura.
 
 Los recortes verificados se muestran como evidencia; las páginas completas y los fotogramas antiguos sin comprobación quedan como referencias de diagnóstico. Si una superposición no puede cerrarse con un control conocido o no puede aislarse el medio, se registra el obstáculo y se omite su OCR. No se ocultan CAPTCHAs para simular una captura correcta.
 
-El límite inicial es de 20 publicaciones por fuente y 8 rondas de desplazamiento; la API admite entre 1 y 200 registros por fuente y entre 1 y 50 rondas. Llegar a esos límites no acredita una captura completa.
+La profundidad rápida es el valor inicial; los límites personalizados admiten 1–200 trabajos y 1–50 rondas por fuente. Las filas conocidas reutilizadas no consumen presupuesto de procesamiento. Alcanzar límites no acredita una captura completa.
 
 ## Fechas y análisis temporal
 
@@ -107,7 +159,7 @@ El límite inicial es de 20 publicaciones por fuente y 8 rondas de desplazamient
 | `first_seen_at` | Primera observación conservada por Huella para ese perfil, fuente y enlace | Seguimiento de futuras capturas; nunca fecha del repost |
 | `order_index` | Posición observada en la muestra de la rejilla | Referencia de navegación, sin valor de fecha |
 
-El colector solo interpreta fechas absolutas completas visibles con año, mes y día. Conserva el texto original de la fecha cuando no puede interpretarlo. No deduce años a partir de etiquetas como «9-12», ni extrae una fecha de interacción del identificador del video.
+El colector acepta `createTime` de la respuesta de TikTok como fecha de publicación original (`published_date_source=tiktok_web_response`). En el respaldo visual solo interpreta fechas absolutas completas visibles con año, mes y día. Conserva el texto original de la fecha cuando no puede interpretarlo. No deduce años a partir de etiquetas como «9-12», ni extrae una fecha de interacción del identificador del video.
 
 **Sin una fecha de interacción verificable no se puede reconstruir cuándo se hizo un repost o un Me gusta.** Un video publicado en septiembre pudo compartirse meses después. Las futuras capturas permiten saber cuándo Huella empezó a observarlo, pero `first_seen_at` tampoco demuestra cuándo ocurrió la interacción. El colector actual no obtiene automáticamente una fecha histórica de repost.
 
@@ -117,40 +169,37 @@ Los temas y el tono explícito se calculan mediante reglas léxicas locales sobr
 
 Las diferencias entre meses son descriptivas: requieren al menos dos registros en cada mes comparado, una diferencia de proporción de al menos 25 puntos y dos registros del tema en alguno de esos meses. No representan significancia estadística ni explican causas. Las etiquetas pueden solaparse, por lo que los porcentajes temáticos no tienen que sumar 100 %.
 
-## Archivos, audio y visión local
+## Archivos, OCR y audio opcional
 
 La carga de archivos admite PNG/JPG/JPEG/WEBP, MP4/MOV/WEBM y WAV/MP3/M4A, hasta **100 MB por archivo**. Las imágenes tienen un límite de 40 megapíxeles. Adjunta solo el medio correspondiente a la evidencia seleccionada.
 
 - **OCR:** incluido en `requirements.txt` mediante RapidOCR y OpenCV. Mantiene el original, aplica reescalado, CLAHE y recortes para leer texto, y reutiliza el modelo entre capturas. La primera lectura puede tardar más.
 - **Video adjunto:** OpenCV muestrea hasta 8 puntos repartidos en el video, mantiene el orden y omite duplicados visuales. Los nombres guardan offsets relativos al video; si se estiman a partir de FPS, puede haber imprecisión en video de velocidad variable. No son fechas de publicación.
 - **Transcripción:** integración opcional con faster-whisper. Procesa hasta los primeros 10 minutos de audio. Puede omitir canto, música o habla poco clara; no identifica canciones.
-- **Visión:** integración opcional con un modelo visual local de Ollama para describir escenas, acciones, texto y contexto. Recibe hasta 8 imágenes y no debe inferir personalidad, atributos sensibles ni vida privada.
+- **Visión:** solo Gemini opcional; como máximo cuatro imágenes reducidas por solicitud. Ningún proveedor debe inferir atributos sensibles o vida privada.
 
-En el entorno preparado para este proyecto, OCR y OpenCV están instalados y se comprobaron con imágenes y un video sintéticos. **Whisper y Ollama no están configurados ni se descargaron sus modelos.** Las funciones ausentes devuelven notas explicativas; un campo vacío no demuestra que el contenido carezca de texto, habla o contexto.
+Whisper es opcional y se carga únicamente al procesar audio o video adjunto por el usuario. Las capturas del navegador no contienen audio ni producen transcripción. No se descargaron modelos durante esta implementación; funciones ausentes producen notas, no contenido inventado.
 
 ### Variables de entorno
 
-`.env.example` es una referencia. **El código no carga `.env` automáticamente.** Configura las variables en la misma PowerShell desde la que arranques el servidor; reinícialo después de cambiarlas.
+El inicio carga `.env` de la raíz sin sobrescribir variables del proceso y sin imprimir claves. Reinicia tras cambiarlo. `HUELLA_DATA_DIR` relativo se resuelve desde la raíz, no desde el directorio de invocación. Elige una carpeta privada del equipo; no compartas sesiones ni credenciales.
 
 Ejemplo para elegir otra carpeta local de datos:
 
-```powershell
-$env:HUELLA_DATA_DIR = 'D:\Huella\datos'
-.\start.ps1
+```sh
+HUELLA_DATA_DIR=data sh start.sh
 ```
 
 Para transcribir con un modelo faster-whisper **ya disponible localmente**, instala primero el paquete opcional y sustituye la ruta por la de tu modelo:
 
-```powershell
-uv pip install --python .\.venv\Scripts\python.exe faster-whisper
-$env:WHISPER_MODEL = 'D:\Modelos\faster-whisper-local'
-$env:WHISPER_ALLOW_DOWNLOAD = '0'
-.\start.ps1
+```sh
+.venv/bin/python -m pip install faster-whisper
+WHISPER_MODEL=/ruta/al/modelo/local WHISPER_ALLOW_DOWNLOAD=0 sh start.sh
 ```
 
-También puedes instalar el paquete con `python.exe -m pip` si tu entorno incluye pip. `WHISPER_ALLOW_DOWNLOAD=1` permite una descarga solicitada explícitamente; el valor predeterminado es `0`. El modelo se ejecuta en CPU con `int8`. Véase [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+`WHISPER_ALLOW_DOWNLOAD=1` permite una descarga solicitada explícitamente; el valor predeterminado es `0`. El modelo se ejecuta en CPU con `int8`. Véase [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
 
-Para visión, instala y arranca Ollama por separado, prepara un modelo compatible con imágenes y establece su nombre exacto mediante `$env:OLLAMA_MODEL`. No hay descarga automática de modelos desde Huella.
+También puedes configurar esas variables en `.env`. No hace falta Whisper para capturar imágenes u obtener OCR.
 
 | Variable | Predeterminado | Efecto |
 | --- | --- | --- |
@@ -159,50 +208,11 @@ Para visión, instala y arranca Ollama por separado, prepara un modelo compatibl
 | `HUELLA_RELOAD` | `0` | `1` recarga código durante desarrollo; cancela trabajos al reiniciar |
 | `WHISPER_MODEL` | Vacío | Ruta o nombre de modelo local/caché; vacío desactiva transcripción |
 | `WHISPER_ALLOW_DOWNLOAD` | `0` | Solo `1` habilita descarga de modelo Whisper |
-| `OLLAMA_MODEL` | Vacío | Nombre del modelo de visión local instalado |
-| `OLLAMA_URL` | `http://127.0.0.1:11434` | Solo localhost/loopback, sin rutas ni credenciales |
-| `OLLAMA_TIMEOUT_SECONDS` | `60` | Espera de la petición local, limitada a 5–120 segundos |
 | `GEMINI_API_KEY` | Vacío | Credencial opcional de Google; selecciona Gemini en Ajustes IA |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Modelo elegido, sin fallback automático |
+| Chrome | Descubrimiento de Windows | Perfil dedicado HuellaBrowser; sin fallback Linux |
 
-La integración de Ollama desactiva proxies y redirecciones, comprueba metadatos antes de enviar imágenes y rechaza modelos cloud o alias remotos detectados. El contexto de páginas y capturas se trata como datos no confiables, no como instrucciones. Los resúmenes generados requieren revisión. Consulta la [API de generación de Ollama](https://docs.ollama.com/api/generate).
-
-## Importar evidencia manual
-
-`POST /api/import` crea un informe a partir de registros. Este ejemplo es **enteramente ficticio**, no contiene enlaces a perfiles ni publicaciones reales y deja la fecha de interacción desconocida:
-
-```json
-{
-  "profile": "demo_ficticia",
-  "collection": {
-    "method": "manual_import",
-    "note": "Ejemplo ficticio para probar el esquema. No representa una cuenta real."
-  },
-  "records": [
-    {
-      "source": "reposts",
-      "url": "",
-      "caption": "Escena de película sobre una despedida. #cine",
-      "published_at": "2025-09-05",
-      "interaction_at": null,
-      "interaction_date_source": null,
-      "observed_at": "2026-10-03T12:00:00-04:00",
-      "first_seen_at": "2026-10-03T12:00:00-04:00",
-      "hashtags": ["#cine"],
-      "music": {},
-      "notes": ["Todos los datos y fechas de este registro son ficticios."]
-    }
-  ]
-}
-```
-
-Guárdalo como `ejemplo.json` y envíalo al servidor local:
-
-```powershell
-$body = Get-Content -LiteralPath .\ejemplo.json -Raw -Encoding UTF8
-Invoke-RestMethod -Method Post -Uri 'http://127.0.0.1:8765/api/import' -ContentType 'application/json; charset=utf-8' -Body ([System.Text.Encoding]::UTF8.GetBytes($body))
-```
-
-Las fuentes admitidas son `uploads`, `reposts`, `likes` y `manual`; el máximo es de 2.000 registros por importación. Una URL real debe ser HTTPS y apuntar a una publicación `/video/` o `/photo/` de TikTok. Los campos `screenshots` y `frames` importados se descartan: adjunta los medios por la interfaz o el endpoint de carga para mantener las rutas dentro de los artefactos locales.
+Los textos de páginas, OCR y capturas son datos no confiables, nunca instrucciones para el modelo. Revisa cada interpretación contra su evidencia.
 
 ## API y arquitectura
 
@@ -211,8 +221,11 @@ La documentación interactiva de FastAPI está en [la API local](http://127.0.0.
 | Método y ruta | Operación |
 | --- | --- |
 | `GET /api/state` | Estado de Chrome, dependencias configuradas, informes y trabajos |
-| `POST /api/session/open` | Abrir Chrome dedicado; cuerpo `{"profile":""}` para iniciar sesión |
-| `POST /api/session/close` | Cerrar Chrome conservando el perfil local |
+| `POST /api/session/open` | Conectar Chrome dedicado de Windows; contexto persistente |
+| `POST /api/session/login` | Mostrar la misma ventana para acceso manual; no cerrarla |
+| `POST /api/preflight` | Inspección explícita de rejillas, sin capturas ni IA |
+| `POST /api/session/close` | Desconectar el puente, sin cerrar Chrome |
+| `POST /api/auto` | Inspección visible y captura/análisis local en un paso |
 | `POST /api/capture` | Capturar `profile`, `sources`, `max_items`, `scroll_rounds`, `mode`, `headless`; devuelve un trabajo |
 | `GET /api/profiles` / `POST /api/profiles` | Listar o guardar perfiles de búsqueda |
 | `GET /api/profiles/{profile}/report` | Informe acumulado del perfil |
@@ -222,13 +235,11 @@ La documentación interactiva de FastAPI está en [la API local](http://127.0.0.
 | `GET /api/jobs/{job_id}` | Consultar progreso y resultado del trabajo |
 | `POST /api/jobs/{job_id}/cancel` | Solicitar cancelación de captura tras la evidencia actual |
 | `GET /api/runs` / `GET /api/runs/{run_id}` | Listar o leer informes persistidos |
-| `POST /api/import` | Importar JSON manual |
 | `PATCH /api/runs/{run_id}/records/{record_id}` | Corregir texto, contexto o fechas verificadas |
 | `POST /api/runs/{run_id}/records/{record_id}/media` | Adjuntar `file` en formulario multipart y procesarlo |
 | `POST /api/runs/{run_id}/records/{record_id}/vision` | Interpretar imágenes con el proveedor configurado |
 | `POST /api/runs/{run_id}/analyze` | Recalcular el informe |
 | `GET /api/runs/{run_id}/export?format=json` | Exportar JSON; `format=md` exporta Markdown |
-| `POST /api/demo` | Crear demostración señalada como ficticia |
 | `GET /data/{path}` | Leer medios admitidos dentro de `data/artifacts/` |
 
 `capabilities` indica que una dependencia/configuración existe; no prueba que un servicio o modelo opcional esté listo. Revisa las notas de procesamiento para conocer el resultado real.
@@ -237,6 +248,7 @@ La documentación interactiva de FastAPI está en [la API local](http://127.0.0.
 | --- | --- |
 | `app/main.py` | API, validación de entradas, trabajos y servicio local |
 | `app/capture.py` | Navegación visible mediante Playwright; un trabajador de Chrome |
+| `app/windows_browser.py` / `app/windows_cdp_bridge.ps1` | Puente stdio y verificación de Chrome dedicado, sin exposición de red |
 | `app/media.py` | OCR, muestreo de archivos, transcripción y descripción visual opcionales |
 | `app/vision.py` | Ajustes IA, clave cifrada, Gemini multimodal, caché y uso |
 | `app/profiles.py` / `app/incremental.py` | Biblioteca acumulada y planificación incremental |
@@ -246,34 +258,29 @@ La documentación interactiva de FastAPI está en [la API local](http://127.0.0.
 | `app/static/` | Interfaz web sin framework |
 | `tests/` | Pruebas de backend, análisis y medios |
 
-Los trabajos activos viven en memoria y no se reanudan tras reiniciar el servidor. Las evidencias guardadas permanecen en disco. La cancelación de captura es cooperativa y se aplica entre evidencias; no interrumpe una inferencia OCR/Whisper/Ollama en curso. Los trabajos independientes de procesamiento multimedia terminan su operación aunque se haya solicitado cancelación.
+Los trabajos activos viven en memoria y no se reanudan tras reiniciar el servidor. Las evidencias guardadas permanecen en disco. La cancelación es cooperativa entre evidencias; no interrumpe una operación OCR/Whisper/Gemini en curso.
 
 ## Datos locales y sesión
 
-### Publicación en Vercel
+La aplicación soportada es local; no expone rutas de demo, importación ni despliegue público. Los helpers históricos quedan aislados y los datos existentes no se borran.
 
-El destino solicitado para alojamiento es Vercel, no ChatGPT Sites. El proyecto actual funciona como una aplicación local: usa Chrome instalado, una sesión persistente, trabajos en segundo plano y archivos duraderos. No debe desplegarse sin adaptar esas dependencias a [los límites de Vercel Functions](https://vercel.com/docs/functions/limitations).
-
-Para una versión remota se necesita separar el panel de un trabajador con almacenamiento persistente y acceso autenticado. La conexión a la sesión del equipo requiere diseñar ese enlace; publicar solo los archivos del frontend dejaría inoperantes las capturas y la biblioteca. `.vercelignore` excluye sesiones, datos, entornos y logs para evitar incluirlos en un despliegue futuro. Todavía no se ha publicado esta app.
-
-- `.browser-profile/` contiene cookies y datos de sesión de Chrome. Es información privada: no compartir, subir a Git ni servir como contenido estático. Ya está excluida en `.gitignore`.
+- `%LOCALAPPDATA%\HuellaBrowser\` contiene cookies y datos de sesión privados en Windows. No compartir ni exportar. El antiguo `.browser-profile/`, si existe, queda intacto pero no se utiliza.
 - `data/runs/` conserva informes JSON; `data/artifacts/` conserva capturas y medios. Ambos pueden contener datos personales o material sensible del contenido consultado. `data/` está excluido de Git.
 - `.env`, `.venv/`, cachés y logs también están excluidos de Git. No se deben incluir credenciales en JSON de importación o capturas.
 - El servidor se publica solo en loopback y limita Host, Origin y rutas de evidencia. No tiene autenticación multiusuario ni cifrado propio de archivos; está pensado para un equipo local de confianza. No lo expongas directamente a la red.
-- Las solicitudes a TikTok ocurren en el navegador. OCR, reglas de análisis y Whisper se ejecutan localmente; Ollama se acepta únicamente en loopback. Gemini es opcional y envía las imágenes y textos seleccionados a Google. La instalación inicial y una descarga de modelo habilitada explícitamente necesitan red.
+- Las solicitudes a TikTok ocurren en el navegador. OCR, análisis léxico y Whisper son locales. Gemini es opcional y envía imágenes y textos seleccionados a Google. Solo instalaciones y descargas solicitadas explícitamente necesitan red fuera del flujo de captura.
 - Para respaldar un informe conserva su JSON y sus artefactos asociados. La exportación JSON/Markdown por sí sola no empaqueta los archivos multimedia ni la sesión de Chrome.
 
-## Verificación y límites pendientes
+## Validación manual pendiente
 
-Ejecuta las pruebas desde la raíz:
+Esta iteración se implementó sin añadir ni ejecutar pruebas automatizadas, por petición del usuario. Las comprobaciones estructurales no acreditan funcionamiento real. Para validar manualmente:
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest -q
-```
-
-Hay pruebas de normalización y rutas, importaciones, fechas, deduplicación, exportación, límites de medios, falta de dependencias, restricciones de Ollama, OCR real con imagen generada y muestreo de MP4 sintético. Los casos que necesitan dependencias opcionales se omiten cuando faltan. Las pruebas no descargan modelos Whisper/Ollama ni consultan perfiles reales.
-
-La suite cubre análisis, separación de cronologías, importación/exportación, validación de rutas y fechas, OCR real y muestreo de video.
+1. Ejecuta `sh start.sh` desde WSL2, abre el panel local y mantén IA desactivada.
+2. Introduce una URL autorizada, selecciona Publicaciones y Rápida, y pulsa Analizar. Comprueba la inspección automática, los mínimos observados y cada recorte.
+3. Si aparece un CAPTCHA o introducción, verifica que se detiene antes de imágenes/OCR/Gemini del desafío. Resuélvelo manualmente en HuellaBrowser, sin cerrar Chrome, y vuelve a analizar. No lo omitas.
+4. Prueba Últimos 30 días solo con publicaciones. Comprueba fechas originales, observaciones sin fecha y exclusiones. Intentar el filtro con compartidos/Me gusta debe rechazarse. Comprueba límites de Personalizada y Todo accesible y sus razones de parada.
+5. Exporta JSON y Markdown: revisa `analysis.executive`, cobertura por fuente, enlaces/IDs, fechas, limitaciones y próximos pasos. Los temas de pérdida o ruptura describen texto, no vivencias del titular.
+6. Solo si aceptas envío y posible coste, configura Gemini y analiza una evidencia. Confirma modelo elegido y error de cuota sin cambio automático. Para audio, adjunta un archivo local con Whisper ya instalado/configurado.
 
 El OCR y el muestreo local se comprobaron con material sintético. Esto **no valida una extracción completa de un perfil real**: la captura en TikTok depende del inicio de sesión manual, la visibilidad de cada pestaña, el contenido cargado y los selectores de su interfaz, que pueden cambiar. Para evaluar una muestra real hay que inspeccionar sus capturas, errores y estados de cobertura.
 
